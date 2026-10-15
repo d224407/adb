@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Empty filter: app shows in the OS "choose app for this USB device" chooser for any
+     attached device; the user still has to pick their own device explicitly. -->
+<resources>
+</resources>

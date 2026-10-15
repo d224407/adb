@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Lấy đúng token màu từ style.css của bạn (:root, không phải khối @media dark). -->
+<resources>
+    <color name="md_primary">#495D92</color>
+    <color name="md_on_primary">#FFFFFF</color>
+    <color name="md_primary_container">#DAE2FF</color>
+    <color name="md_on_primary_container">#304578</color>
+    <color name="md_secondary_container">#DCE2F9</color>
+    <color name="md_on_secondary_container">#404659</color>
+    <color name="md_error_container">#FFDAD6</color>
+    <color name="md_on_error_container">#93000A</color>
+    <color name="md_surface">#FAF8FF</color>
+    <color name="md_surface_container">#F1F0F7</color>
+    <color name="md_surface_container_high">#EEEDF4</color>
+    <color name="md_surface_container_highest">#E8E7EF</color>
+    <color name="md_on_surface">#1A1B21</color>
+    <color name="md_on_surface_variant">#45464F</color>
+    <color name="md_outline">#757780</color>
+    <color name="md_outline_variant">#C5C6D0</color>
+</resources>

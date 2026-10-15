@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- app_name được sinh theo build variant qua resValue() trong app/build.gradle.kts -->
+</resources>
