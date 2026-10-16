@@ -60,7 +60,8 @@ class MainActivity : AppCompatActivity() {
     private var remotePort = 5555
     private var packageShowSystem = false
     private var packageStateFilter = 0 // 0 = all, 1 = enabled only, 2 = disabled only
-    private var packageRaw = ""
+    private var packageRawUser = ""
+    private var packageRawSystem = ""
     private var processRaw = ""
     private var filePathEdit: EditText? = null
     private var fileListContainer: LinearLayout? = null
@@ -240,32 +241,16 @@ class MainActivity : AppCompatActivity() {
             divider(container)
         }
 
-        container.addView(ui.pill("Connect USB") { connectUsb() }, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
+        container.addView(ui.label("Wireless debugging", 14f, R.color.md_on_surface, bold = true), matchWrap())
 
         val scanStatus = ui.label("Scanning the local network for port 5555...", 13f, R.color.md_on_surface_variant)
-        container.addView(scanStatus, matchWrap())
+        container.addView(scanStatus, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
         val suggestions = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         container.addView(suggestions, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6); bottomMargin = dp(6) })
 
-        val ipField = edit(container, "TV IP address", remoteIp, InputType.TYPE_CLASS_TEXT)
-        val portField = edit(container, "ADB port (default 5555)", remotePort.toString(), InputType.TYPE_CLASS_NUMBER)
-        container.addView(ui.pill("Connect", primary = true) {
-            remoteIp = ipField.text.toString().trim()
-            remotePort = portField.text.toString().toIntOrNull() ?: 5555
-            connectNetwork(remoteIp, remotePort)
-        }, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4); bottomMargin = dp(8) })
-
-        divider(container)
-        container.addView(ui.label("Pair a new device (Wireless debugging)", 14f, R.color.md_on_surface, bold = true), matchWrap())
-        val pairIp = edit(container, "Pairing IP:port (shown on the TV)", "", InputType.TYPE_CLASS_TEXT)
-        val pairCode = edit(container, "6-digit pairing code", "", InputType.TYPE_CLASS_NUMBER)
-        container.addView(ui.label(
-            "Pairing uses a different, TLS-based handshake from a normal ADB connection and isn't implemented in this build yet. Pair the TV from its own Settings first, then use Connect above with the IP/port it ends up listening on.",
-            12.5f, R.color.md_on_surface_variant
-        ).apply { setPadding(0, dp(2), 0, dp(6)) }, matchWrap())
-        container.addView(ui.pill("Pair") {
-            toast("Pairing isn't implemented yet - pair from the TV's Settings first, then Connect above.")
-        }, matchWrap())
+        // IP only - no port field. Normal Wireless Debugging devices listen on 5555, so that's
+        // always what's used to connect; no need to ask for it.
+        val wirelessField = edit(container, "TV IP address", remoteIp, InputType.TYPE_CLASS_TEXT)
 
         val cancelled = AtomicBoolean(false)
         val dialog = AlertDialog.Builder(this)
@@ -274,13 +259,27 @@ class MainActivity : AppCompatActivity() {
             .setNegativeButton("Close", null)
             .setOnDismissListener { cancelled.set(true) }
             .create()
+
+        container.addView(ui.pill("Connect", primary = true) {
+            val host = wirelessField.text.toString().trim()
+            if (host.isBlank()) { toast("Enter the TV's IP address"); return@pill }
+            remoteIp = host; remotePort = 5555
+            connectNetwork(host, 5555)
+            dialog.dismiss()
+        }, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4); bottomMargin = dp(8) })
+
         dialog.show()
 
+        // Any suggested IP found listening on 5555 connects to that device immediately on tap.
         scanForAdbDevices(
             onFound = { ip ->
                 if (cancelled.get()) return@scanForAdbDevices
-                suggestions.addView(ui.pill(ip) { ipField.setText(ip) },
-                    LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(4) })
+                suggestions.addView(ui.pill(ip) {
+                    wirelessField.setText(ip)
+                    remoteIp = ip; remotePort = 5555
+                    connectNetwork(ip, 5555)
+                    dialog.dismiss()
+                }, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(4) })
             },
             onDone = { found ->
                 if (cancelled.get()) return@scanForAdbDevices
@@ -480,25 +479,38 @@ class MainActivity : AppCompatActivity() {
         val result = outputView(root, "Waiting for the package list...")
         packageFilter?.addTextChangedListener(SimpleTextWatcher { filter ->
             list.removeAllViews()
-            renderPackageRows(list, packageRaw, filter, result)
+            renderPackageRows(list, filter, result)
         })
-        refreshPackages(root) { raw -> list.removeAllViews(); renderPackageRows(list, raw, packageFilter?.text?.toString().orEmpty(), result) }
+        refreshPackages(root) { list.removeAllViews(); renderPackageRows(list, packageFilter?.text?.toString().orEmpty(), result) }
     }
 
-    private fun refreshPackages(root: LinearLayout, done: ((String) -> Unit)? = null) {
-        var command = "pm list packages"
-        if (!packageShowSystem) command += " -3"
-        command += when (packageStateFilter) { 1 -> " -e"; 2 -> " -d"; else -> "" }
-        runShell(command) { raw ->
-            packageRaw = raw
-            done?.invoke(raw)
-            if (done == null) renderTab(TAB_PACKAGES)
+    /** Fetches user (-3) and, if requested, system (-s) packages as two separate lists so
+     *  renderPackageRows can always show user apps before system apps. */
+    private fun refreshPackages(root: LinearLayout, done: (() -> Unit)? = null) {
+        val stateFlag = when (packageStateFilter) { 1 -> " -e"; 2 -> " -d"; else -> "" }
+        runShell("pm list packages -3$stateFlag") { userRaw ->
+            packageRawUser = userRaw
+            if (packageShowSystem) {
+                runShell("pm list packages -s$stateFlag") { systemRaw ->
+                    packageRawSystem = systemRaw
+                    if (done != null) done() else renderTab(TAB_PACKAGES)
+                }
+            } else {
+                packageRawSystem = ""
+                if (done != null) done() else renderTab(TAB_PACKAGES)
+            }
         }
     }
 
-    private fun renderPackageRows(list: LinearLayout, raw: String, filter: String, result: TextView) {
-        val packages = raw.lineSequence().map { it.trim().removePrefix("package:") }
+    private fun parsePackageList(raw: String, filter: String): List<String> =
+        raw.lineSequence().map { it.trim().removePrefix("package:") }
             .filter { it.isNotBlank() && it.contains(filter, ignoreCase = true) }.distinct().sorted().toList()
+
+    /** User apps first, system apps after - each group sorted alphabetically within itself. */
+    private fun renderPackageRows(list: LinearLayout, filter: String, result: TextView) {
+        val userPkgs = parsePackageList(packageRawUser, filter)
+        val systemPkgs = if (packageShowSystem) parsePackageList(packageRawSystem, filter) else emptyList()
+        val packages = userPkgs + systemPkgs
         result.text = "${packages.size} packages shown."
         val cards = packages.map { pkg -> buildPackageCard(pkg, list) }
         list.addView(chainedGroup(cards), matchWrap())
@@ -514,6 +526,8 @@ class MainActivity : AppCompatActivity() {
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            isFocusable = true
+            isClickable = true
             addView(icon, LinearLayout.LayoutParams(dp(40), dp(40)).apply { marginEnd = dp(12) })
             addView(
                 LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL; addView(nameView); addView(pkgView) },
@@ -525,10 +539,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(16), dp(14), dp(16), dp(14))
             addView(header, matchWrap())
         }
-        lateinit var infoButtonRef: TextView
-        infoButtonRef = ui.pill("Load info") { loadPackageInfo(pkg, nameView, icon, infoButtonRef) }
         val actionsTop = ui.actionRow(
-            infoButtonRef,
             ui.pill("Launch") { runShell("monkey -p ${shellQuote(pkg)} -c android.intent.category.LAUNCHER 1") { setStatus(it.ifBlank { "Launch request sent for $pkg" }) } },
             ui.pill("Stop") { runShell("am force-stop ${shellQuote(pkg)}") { setStatus(it.ifBlank { "Force-stop sent for $pkg" }) } }
         )
@@ -547,17 +558,24 @@ class MainActivity : AppCompatActivity() {
                     }.show()
             }
         )
+        // Tools stay collapsed until the card header (icon + name) is tapped.
+        actionsTop.visibility = View.GONE
+        actionsBottom.visibility = View.GONE
+        header.setOnClickListener {
+            val expanded = actionsTop.visibility == View.VISIBLE
+            actionsTop.visibility = if (expanded) View.GONE else View.VISIBLE
+            actionsBottom.visibility = if (expanded) View.GONE else View.VISIBLE
+        }
         card.addView(actionsTop, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(10) })
         card.addView(actionsBottom, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
+        loadPackageInfo(pkg, nameView, icon)
         return card
     }
 
-    /** pm path -> pull the APK into cache -> getPackageArchiveInfo for the real icon + label,
-     *  exactly the flow from the notes you sent. Deliberately on-demand per row (not automatic
-     *  for the whole list) since pulling every APK for a large package list would be slow and
-     *  would hammer the ADB connection; tap "Load info" on the apps you actually want details for. */
-    private fun loadPackageInfo(pkg: String, nameView: TextView, icon: ImageView, button: TextView) {
-        button.text = "Loading..."
+    /** pm path -> pull the APK into cache -> getPackageArchiveInfo for the real icon + label.
+     *  Runs automatically for every row so icons/labels show by default; failures are silent
+     *  and just leave that row on its package-name fallback. */
+    private fun loadPackageInfo(pkg: String, nameView: TextView, icon: ImageView) {
         thread(name = "adb-pull-apk") {
             var cacheFile: File? = null
             try {
@@ -584,10 +602,9 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     if (!label.isNullOrBlank()) nameView.text = label
                     if (drawable != null) icon.setImageDrawable(drawable)
-                    button.text = if (label != null) "Loaded" else "No info"
                 }
             } catch (e: Exception) {
-                runOnUiThread { button.text = "Load info"; setStatus("Could not load info for $pkg: ${e.message}") }
+                // Silent: row just keeps showing the package name with no icon.
             } finally {
                 cacheFile?.let { runCatching { it.delete() } }
             }
