@@ -268,6 +268,19 @@ class MainActivity : AppCompatActivity() {
             dialog.dismiss()
         }, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4); bottomMargin = dp(8) })
 
+        divider(container)
+        container.addView(ui.label("Pair a new device (Wireless debugging)", 14f, R.color.md_on_surface, bold = true), matchWrap())
+        val pairIp = edit(container, "Pairing IP:port (shown on the TV)", "", InputType.TYPE_CLASS_TEXT)
+        val pairCode = edit(container, "6-digit pairing code", "", InputType.TYPE_CLASS_NUMBER)
+        container.addView(ui.label(
+            "Pairing uses a different, TLS-based handshake from a normal ADB connection and isn't implemented in this build yet. Pair the TV from its own Settings first, then use the field above with the IP it ends up listening on.",
+            12.5f, R.color.md_on_surface_variant
+        ).apply { setPadding(0, dp(2), 0, dp(6)) }, matchWrap())
+        container.addView(ui.pill("Pair") {
+            if (pairIp.text.toString().isBlank() || pairCode.text.toString().isBlank()) { toast("Enter the pairing IP:port and the 6-digit code"); return@pill }
+            toast("Pairing isn't implemented yet - pair from the TV's Settings first, then Connect above.")
+        }, matchWrap())
+
         dialog.show()
 
         // Any suggested IP found listening on 5555 connects to that device immediately on tap.
