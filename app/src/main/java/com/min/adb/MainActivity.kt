@@ -133,6 +133,8 @@ class MainActivity : AppCompatActivity() {
         statusView = TextView(this).apply {
             text = "Not connected"
             textSize = 13f
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
             setPadding(dp(16), dp(2), dp(16), dp(10))
             setTextColor(color(R.color.md_on_surface_variant))
         }
@@ -586,21 +588,21 @@ class MainActivity : AppCompatActivity() {
             addView(header, matchWrap())
         }
         val actionsTop = ui.actionRow(
-            ui.pill("Launch") { runCommand("monkey -p ${shellQuote(pkg)} -c android.intent.category.LAUNCHER 1") { setStatus(it.ifBlank { "Launch request sent for $pkg" }) } },
-            ui.pill("Stop") { runCommand("am force-stop ${shellQuote(pkg)}") { setStatus(it.ifBlank { "Force-stop sent for $pkg" }) } }
+            ui.pill("Launch") { runCommand("monkey -p ${shellQuote(pkg)} -c android.intent.category.LAUNCHER 1") { toast(shortResult(it, "Launched $pkg")) } },
+            ui.pill("Stop") { runCommand("am force-stop ${shellQuote(pkg)}") { toast(shortResult(it, "Stopped $pkg")) } }
         )
         val actionsBottom = ui.actionRow(
-            ui.pill("Enable") { runCommand("pm enable ${shellQuote(pkg)}") { setStatus(it.ifBlank { "Enable sent for $pkg" }) } },
+            ui.pill("Enable") { runCommand("pm enable ${shellQuote(pkg)}") { toast(shortResult(it, "Enabled $pkg")) } },
             ui.pill("Disable") {
                 AlertDialog.Builder(this).setTitle("Disable $pkg?").setMessage("Disabling a system package can break TV features until re-enabled.")
                     .setNegativeButton("Cancel", null).setPositiveButton("Disable") { _, _ ->
-                        runCommand("pm disable-user --user 0 ${shellQuote(pkg)}") { setStatus(it.ifBlank { "Disable sent for $pkg" }) }
+                        runCommand("pm disable-user --user 0 ${shellQuote(pkg)}") { toast(shortResult(it, "Disabled $pkg")) }
                     }.show()
             },
             ui.pill("Uninstall") {
                 AlertDialog.Builder(this).setTitle("Uninstall $pkg?").setMessage("Uninstall $pkg for the current user on the target device?")
                     .setNegativeButton("Cancel", null).setPositiveButton("Uninstall") { _, _ ->
-                        runCommand("pm uninstall --user 0 ${shellQuote(pkg)}") { setStatus(it); refreshPackages(listOwner) }
+                        runCommand("pm uninstall --user 0 ${shellQuote(pkg)}") { toast(shortResult(it, "Uninstalled $pkg")); refreshPackages(listOwner) }
                     }.show()
             }
         )
@@ -936,7 +938,7 @@ class MainActivity : AppCompatActivity() {
         row(root, listOf(
             "List" to { listRemoteFiles(path.text.toString()) },
             "Up to parent" to { path.setText(parentPath(path.text.toString())); listRemoteFiles(path.text.toString()) },
-            "New folder" to { askText("New folder name") { name -> runShell("mkdir -p ${shellQuote(joinRemote(path.text.toString(), name))}") { setStatus(it.ifBlank { "Create-folder command sent" }); listRemoteFiles(path.text.toString()) } } }
+            "New folder" to { askText("New folder name") { name -> runCommand("mkdir -p ${shellQuote(joinRemote(path.text.toString(), name))}") { toast("Folder created"); listRemoteFiles(path.text.toString()) } } }
         ))
         row(root, listOf(
             "Push file to TV" to { pendingPushPath = path.text.toString().trim().ifBlank { "/sdcard" }; pickLocalFile() },
@@ -983,7 +985,7 @@ class MainActivity : AppCompatActivity() {
                 0 -> { pendingPullPath = remotePath; createLocalFile(remotePath) }
                 1 -> runShell("head -c 65536 ${shellQuote(remotePath)}") { output.text = it }
                 2 -> AlertDialog.Builder(this).setMessage("Delete $remotePath on the target device?").setNegativeButton("Cancel", null)
-                    .setPositiveButton("Delete") { _, _ -> runShell("rm -f ${shellQuote(remotePath)}") { output.text = it.ifBlank { "Delete command sent" }; refreshed() } }.show()
+                    .setPositiveButton("Delete") { _, _ -> runCommand("rm -f ${shellQuote(remotePath)}") { toast("Deleted"); refreshed() } }.show()
             }
         }.show()
     }
@@ -1103,6 +1105,12 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+    }
+
+    /** One short line for a toast: the command's first line if it printed one, else [fallback]. */
+    private fun shortResult(output: String, fallback: String): String {
+        val line = output.lineSequence().map { it.trim() }.firstOrNull { it.isNotBlank() && it != "(no output)" }
+        return if (line != null && line.startsWith("Success", true)) line.take(60) else fallback
     }
 
     private fun requireAdb(): AdbConnection = adb ?: throw IOException("Not connected")
