@@ -5,6 +5,9 @@ plugins {
     alias(libs.plugins.kotlin.android)
 }
 
+// So the copyIconHelperApk task below can read :iconhelper's configured output directory.
+evaluationDependsOn(":iconhelper")
+
 // --- Release signing: read from keystore.properties if present (git-ignored) ------------------
 val keystoreProps = Properties().apply {
     val f = rootProject.file("keystore.properties")
@@ -103,3 +106,18 @@ dependencies {
 
     testImplementation(libs.junit)
 }
+
+// ------------------------------------------------------------------------------------------
+// Bundle the headless :iconhelper APK as a raw asset so MainActivity can push + `pm install`
+// it onto the TV on demand (see bulkFetchIcons in MainActivity.kt). Rebuilding :iconhelper's
+// debug APK and copying it into app/src/main/assets runs automatically before every build.
+// ------------------------------------------------------------------------------------------
+val copyIconHelperApk by tasks.registering(Copy::class) {
+    dependsOn(":iconhelper:assembleDebug")
+    from(project(":iconhelper").layout.buildDirectory.dir("outputs/apk/debug")) {
+        include("iconhelper-debug.apk")
+        rename { "iconhelper.apk" }
+    }
+    into("src/main/assets")
+}
+tasks.named("preBuild") { dependsOn(copyIconHelperApk) }

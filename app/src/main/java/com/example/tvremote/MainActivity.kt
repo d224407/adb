@@ -4,6 +4,7 @@ import android.app.AlertDialog
 import android.app.PendingIntent
 import android.content.Intent
 import android.database.Cursor
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbManager
@@ -36,6 +37,7 @@ import com.example.tvremote.ui.Ui
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.RandomAccessFile
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.Socket
@@ -367,6 +369,7 @@ class MainActivity : AppCompatActivity() {
                 connection.connect()
                 adb?.close(); adb = connection
                 runOnUiThread { updateConnectionChip(); setStatus("Connected - $host:$port") }
+                prefetchIconsAfterConnect()
             } catch (e: Exception) {
                 runOnUiThread { setStatus("Connection failed: ${e.message ?: e.javaClass.simpleName}") }
             }
@@ -389,6 +392,7 @@ class MainActivity : AppCompatActivity() {
                 val connection = AdbConnection(UsbTransport(manager, device), crypto)
                 connection.connect(); adb?.close(); adb = connection
                 runOnUiThread { updateConnectionChip(); setStatus("Connected over USB") }
+                prefetchIconsAfterConnect()
             } catch (e: Exception) { runOnUiThread { setStatus("USB connection failed: ${e.message}") } }
         }
     }
@@ -525,14 +529,31 @@ class MainActivity : AppCompatActivity() {
         val systemPkgs = if (packageShowSystem) parsePackageList(packageRawSystem, filter) else emptyList()
         val packages = userPkgs + systemPkgs
         result.text = "${packages.size} packages shown."
-        val cards = packages.map { pkg -> buildPackageCard(pkg, list) }
+        val views = HashMap<String, Pair<TextView, ImageView>>()
+        val cards = packages.map { pkg -> buildPackageCard(pkg, list, views) }
         list.addView(chainedGroup(cards), matchWrap())
+
+        // Fast path: one on-device helper app dumps every icon+label into small PNGs, we tar
+        // and pull that single file. Anything it couldn't resolve (or if it fails entirely)
+        // falls back to the slower per-app "pull the APK" path so icons still show either way.
+        bulkFetchIcons { bulk ->
+            for ((pkg, viewPair) in views) {
+                val (nameView, icon) = viewPair
+                val hit = bulk[pkg]
+                if (hit != null) {
+                    if (!hit.first.isNullOrBlank()) nameView.text = hit.first
+                    if (hit.second != null) icon.setImageBitmap(hit.second)
+                } else {
+                    loadPackageInfo(pkg, nameView, icon)
+                }
+            }
+        }
     }
 
     /** One package "card": app name + package name, then small action buttons underneath -
      *  matches the pm/APK flow described in the notes you sent (pm path, pull the APK,
      *  getPackageArchiveInfo for the real icon/label, pm enable/disable-user, am force-stop). */
-    private fun buildPackageCard(pkg: String, listOwner: LinearLayout): LinearLayout {
+    private fun buildPackageCard(pkg: String, listOwner: LinearLayout, views: MutableMap<String, Pair<TextView, ImageView>>): LinearLayout {
         val icon = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_INSIDE }
         val nameView = ui.label(pkg, 16.5f, R.color.md_on_surface, bold = true).apply { setPadding(0, 0, 0, dp(1)) }
         val pkgView = ui.label(pkg, 13f, R.color.md_on_surface_variant)
@@ -581,8 +602,121 @@ class MainActivity : AppCompatActivity() {
         }
         card.addView(actionsTop, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(10) })
         card.addView(actionsBottom, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
-        loadPackageInfo(pkg, nameView, icon)
+        views[pkg] = nameView to icon
         return card
+    }
+
+    // ──────────────────────── Fast bulk icon/label fetch via the on-device helper ────────────────────────
+    private val HELPER_PKG = "com.example.tvremote.iconhelper"
+    private val HELPER_ACTION = "com.example.tvremote.iconhelper.DUMP_ICONS"
+    private val HELPER_REMOTE_DIR = "/sdcard/tvremote_icons"
+    private val bulkIconCache = HashMap<String, Pair<String?, Bitmap?>>()
+    @Volatile private var iconsPrefetched = false
+
+    /** Installs (once) a tiny headless helper app on the TV that reads every icon/label straight
+     *  from its own on-device PackageManager - no per-app APK pulls needed. It writes small PNGs
+     *  plus a manifest.csv, we tar them into ONE file on-device and pull just that, which is far
+     *  faster than pulling one full APK per installed app. Falls back silently (empty map) to let
+     *  the caller use the old per-app pull for whatever this couldn't resolve. */
+    private fun bulkFetchIcons(onResult: (Map<String, Pair<String?, Bitmap?>>) -> Unit) {
+        synchronized(bulkIconCache) {
+            if (iconsPrefetched) {
+                onResult(HashMap(bulkIconCache))
+                return
+            }
+        }
+        val connection = adb
+        if (connection == null) { onResult(emptyMap()); return }
+        thread(name = "adb-bulk-icons") {
+            val result = HashMap<String, Pair<String?, Bitmap?>>()
+            try {
+                // 1) Make sure the headless helper app is installed on the TV.
+                val pathCheck = connection.shell("pm path $HELPER_PKG")
+                if (!pathCheck.contains("package:")) {
+                    val apk = File(cacheDir, "iconhelper.apk")
+                    assets.open("iconhelper.apk").use { input -> apk.outputStream().use { input.copyTo(it) } }
+                    AdbSyncClient(connection).push(apk.inputStream(), "/data/local/tmp/iconhelper.apk")
+                    val install = connection.shell("pm install -r /data/local/tmp/iconhelper.apk")
+                    if (!install.contains("Success")) throw IOException("helper install failed: $install")
+                    apk.delete()
+                }
+
+                // 2) Trigger the dump (headless - no UI appears on the TV) and wait for it to finish.
+                connection.shell("rm -rf $HELPER_REMOTE_DIR")
+                connection.shell("am broadcast -a $HELPER_ACTION")
+                var waited = 0
+                while (waited < 20_000) {
+                    val done = connection.shell("ls $HELPER_REMOTE_DIR/DONE 2>/dev/null")
+                    if (done.contains("DONE")) break
+                    Thread.sleep(400); waited += 400
+                }
+
+                // 3) Pack everything into one tar on-device and pull that single file.
+                val remoteTar = "$HELPER_REMOTE_DIR.tar"
+                connection.shell("tar -cf $remoteTar -C $HELPER_REMOTE_DIR .")
+                val localTar = File(cacheDir, "tvremote_icons.tar")
+                FileOutputStream(localTar).use { out -> AdbSyncClient(connection).pull(remoteTar, out) }
+                connection.shell("rm -rf $HELPER_REMOTE_DIR $remoteTar")
+
+                // 4) Extract locally and decode.
+                val entries = untar(localTar)
+                localTar.delete()
+                val manifest = entries["manifest.csv"]?.toString(Charsets.UTF_8).orEmpty()
+                val labels = manifest.lineSequence().mapNotNull { line ->
+                    val idx = line.indexOf(',')
+                    if (idx <= 0) null else line.substring(0, idx) to line.substring(idx + 1)
+                }.toMap()
+                for ((name, bytes) in entries) {
+                    if (!name.endsWith(".png")) continue
+                    val pkg = name.removeSuffix(".png")
+                    val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    result[pkg] = labels[pkg] to bmp
+                }
+            } catch (e: Exception) {
+                // Bulk path failed (no tar binary, install blocked, etc.) - leave result as-is;
+                // whatever's missing falls back to the per-app pull in renderPackageRows.
+            }
+            synchronized(bulkIconCache) {
+                bulkIconCache.clear()
+                bulkIconCache.putAll(result)
+                iconsPrefetched = true
+            }
+            runOnUiThread { onResult(result) }
+        }
+    }
+
+    /** Fetch icons immediately after ADB connects, so the package icons are ready before
+     *  the user opens the Packages tab. Uses the existing bulk pull path only. */
+    private fun prefetchIconsAfterConnect() {
+        synchronized(bulkIconCache) {
+            if (iconsPrefetched) return
+        }
+        bulkFetchIcons { /* cached for the Packages tab */ }
+    }
+
+    /** Minimal reader for the flat POSIX ustar files Android's toybox `tar` produces here - just
+     *  enough to read back the file set written by the helper app (no subdirectories). */
+    private fun untar(file: File): Map<String, ByteArray> {
+        val out = HashMap<String, ByteArray>()
+        RandomAccessFile(file, "r").use { raf ->
+            val header = ByteArray(512)
+            while (raf.read(header) == 512) {
+                if (header.all { it == 0.toByte() }) break
+                val name = String(header, 0, 100, Charsets.US_ASCII).trim('\u0000', ' ')
+                val sizeOctal = String(header, 124, 12, Charsets.US_ASCII).trim('\u0000', ' ')
+                val size = if (sizeOctal.isBlank()) 0L else sizeOctal.toLong(8)
+                if (name.isNotBlank() && !name.endsWith("/")) {
+                    val data = ByteArray(size.toInt())
+                    raf.readFully(data)
+                    out[name.substringAfterLast('/')] = data
+                } else {
+                    raf.skipBytes(size.toInt())
+                }
+                val padding = ((512 - (size % 512)) % 512).toInt()
+                raf.skipBytes(padding)
+            }
+        }
+        return out
     }
 
     /** pm path -> pull the APK into cache -> getPackageArchiveInfo for the real icon + label.

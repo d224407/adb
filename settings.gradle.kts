@@ -20,3 +20,4 @@ dependencyResolutionManagement {
 }
 rootProject.name = "TVRemote"
 include(":app")
+include(":iconhelper")

@@ -1,0 +1,21 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+
+    <application
+        android:label="TVRemote Icon Helper"
+        android:allowBackup="false"
+        android:hasCode="true">
+
+        <!-- Headless: no activity/launcher icon on the TV. Triggered purely from the ADB side
+             with: adb shell am broadcast -a com.example.tvremote.iconhelper.DUMP_ICONS -->
+        <receiver
+            android:name=".DumpReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.example.tvremote.iconhelper.DUMP_ICONS" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
