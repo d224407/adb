@@ -2,19 +2,21 @@
 
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <!-- Android 11+ filters installed packages unless the helper explicitly declares this. -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
 
     <application
-        android:label="TVRemote Icon Helper"
+        android:label="ADB Icon Helper"
         android:allowBackup="false"
         android:hasCode="true">
 
         <!-- Headless: no activity/launcher icon on the TV. Triggered purely from the ADB side
-             with: adb shell am broadcast -a com.example.tvremote.iconhelper.DUMP_ICONS -->
+             with: adb shell am broadcast -a com.min.adb.iconhelper.DUMP_ICONS -->
         <receiver
             android:name=".DumpReceiver"
             android:exported="true">
             <intent-filter>
-                <action android:name="com.example.tvremote.iconhelper.DUMP_ICONS" />
+                <action android:name="com.min.adb.iconhelper.DUMP_ICONS" />
             </intent-filter>
         </receiver>
     </application>

@@ -1,4 +1,4 @@
-package com.example.tvremote.iconhelper
+package com.min.adb.iconhelper
 
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -10,12 +10,12 @@ import android.graphics.drawable.Drawable
 import java.io.File
 
 /**
- * Runs entirely on the TV. This is the "mồi" app idea: instead of the remote pulling every APK
+ * Runs entirely on the TV. This is the stub app idea: instead of the remote pulling every APK
  * over ADB and parsing it just to read one icon, this tiny helper sits on-device and asks the
  * TV's own PackageManager directly - which is instant, since it never has to touch an APK file.
  *
  * Writes one small PNG per installed app plus a manifest.csv (packageName,label) into
- * /sdcard/tvremote_icons, then drops a DONE sentinel so the caller on the phone/controller side
+ * /sdcard/adb_icons, then drops a DONE sentinel so the caller on the phone/controller side
  * knows when it's safe to tar + pull the whole folder in one shot.
  */
 class DumpReceiver : BroadcastReceiver() {
@@ -36,7 +36,7 @@ class DumpReceiver : BroadcastReceiver() {
 
     private fun dumpAll(context: Context) {
         val pm = context.packageManager
-        val dir = File("/sdcard/tvremote_icons")
+        val dir = File("/sdcard/adb_icons")
         dir.deleteRecursively()
         dir.mkdirs()
 

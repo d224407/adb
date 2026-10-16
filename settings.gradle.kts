@@ -18,6 +18,6 @@ dependencyResolutionManagement {
         mavenCentral()
     }
 }
-rootProject.name = "TVRemote"
+rootProject.name = "ADB"
 include(":app")
 include(":iconhelper")

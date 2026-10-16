@@ -16,11 +16,11 @@ val keystoreProps = Properties().apply {
 val hasReleaseKeystore = keystoreProps.getProperty("storeFile") != null
 
 android {
-    namespace = "com.example.tvremote"
+    namespace = "com.min.adb"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.example.tvremote"
+        applicationId = "com.min.adb"
         minSdk = 24
         targetSdk = 34
         versionCode = 1

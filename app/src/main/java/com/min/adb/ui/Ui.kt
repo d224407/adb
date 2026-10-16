@@ -1,4 +1,4 @@
-package com.example.tvremote.ui
+package com.min.adb.ui
 
 import android.content.Context
 import android.content.res.ColorStateList
@@ -16,7 +16,7 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.core.content.ContextCompat
-import com.example.tvremote.R
+import com.min.adb.R
 
 /** Material 3 style UI builder based on style.css (colors from res/values[-night]/colors.xml). */
 class Ui(val ctx: Context) {

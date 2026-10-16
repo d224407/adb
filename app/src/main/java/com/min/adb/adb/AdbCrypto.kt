@@ -1,4 +1,4 @@
-package com.example.tvremote.adb
+package com.min.adb.adb
 
 import android.content.Context
 import android.util.Base64
@@ -47,8 +47,8 @@ class AdbCrypto private constructor(val keyPair: KeyPair) {
     }
 
     companion object {
-        private const val FILE_PRIV = "tvremote_adbkey_priv"
-        private const val FILE_PUB = "tvremote_adbkey_pub"
+        private const val FILE_PRIV = "adb_key_priv"
+        private const val FILE_PUB = "adb_key_pub"
 
         fun loadOrGenerate(context: Context): AdbCrypto {
             val dir = context.filesDir

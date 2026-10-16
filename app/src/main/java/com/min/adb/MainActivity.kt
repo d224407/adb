@@ -1,4 +1,4 @@
-package com.example.tvremote
+package com.min.adb
 
 import android.app.AlertDialog
 import android.app.PendingIntent
@@ -26,16 +26,16 @@ import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import com.example.tvremote.adb.AdbConnection
-import com.example.tvremote.adb.AdbCrypto
-import com.example.tvremote.adb.AdbSyncClient
-import com.example.tvremote.adb.transport.TcpTransport
-import com.example.tvremote.adb.transport.UsbTransport
-import com.example.tvremote.ui.Ui
+import com.min.adb.adb.AdbConnection
+import com.min.adb.adb.AdbCrypto
+import com.min.adb.adb.AdbSyncClient
+import com.min.adb.adb.transport.TcpTransport
+import com.min.adb.adb.transport.UsbTransport
+import com.min.adb.ui.Ui
 import java.io.File
 import java.io.FileOutputStream
+import java.io.FileInputStream
 import java.io.IOException
 import java.io.RandomAccessFile
 import java.net.InetSocketAddress
@@ -50,6 +50,9 @@ import kotlin.concurrent.thread
 /** ADB utility with persistent bottom tabs. All remote commands require a user-authorized ADB connection. */
 class MainActivity : AppCompatActivity() {
     private lateinit var statusView: TextView
+    private lateinit var rootFrame: FrameLayout
+    private var toastView: TextView? = null
+    private val toastHide = Runnable { dismissToast() }
     private lateinit var ipChip: TextView
     private lateinit var content: FrameLayout
     private lateinit var tabsRow: LinearLayout
@@ -97,6 +100,7 @@ class MainActivity : AppCompatActivity() {
         // Outer frame: scrollable content behind a floating pill nav bar, same layering as
         // #pages + .nav-bar in style.css (nav bar pinned to the bottom, not pushing content).
         val frame = FrameLayout(this).apply { setBackgroundColor(color(R.color.md_surface)) }
+        rootFrame = frame
 
         val page = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
@@ -233,6 +237,7 @@ class MainActivity : AppCompatActivity() {
 
     // ─────────────────────────────── Connect dialog: scan + manual + pairing ───────────────────────────────
     private fun openConnectDialog() {
+        var dialog: AlertDialog? = null
         val container = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), dp(8)) }
 
         if (adb != null) {
@@ -243,6 +248,11 @@ class MainActivity : AppCompatActivity() {
             divider(container)
         }
 
+        container.addView(ui.pill("Connect via USB") {
+            dialog?.dismiss()
+            connectUsb()
+        }, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4); bottomMargin = dp(8) })
+        divider(container)
         container.addView(ui.label("Wireless debugging", 14f, R.color.md_on_surface, bold = true), matchWrap())
 
         val scanStatus = ui.label("Scanning the local network for port 5555...", 13f, R.color.md_on_surface_variant)
@@ -255,8 +265,8 @@ class MainActivity : AppCompatActivity() {
         val wirelessField = edit(container, "TV IP address", remoteIp, InputType.TYPE_CLASS_TEXT)
 
         val cancelled = AtomicBoolean(false)
-        val dialog = AlertDialog.Builder(this)
-            .setTitle("Connect to TV")
+        dialog = AlertDialog.Builder(this)
+            .setTitle("Connect to device")
             .setView(ScrollView(this).apply { addView(container) })
             .setNegativeButton("Close", null)
             .setOnDismissListener { cancelled.set(true) }
@@ -267,7 +277,7 @@ class MainActivity : AppCompatActivity() {
             if (host.isBlank()) { toast("Enter the TV's IP address"); return@pill }
             remoteIp = host; remotePort = 5555
             connectNetwork(host, 5555)
-            dialog.dismiss()
+            dialog?.dismiss()
         }, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4); bottomMargin = dp(8) })
 
         divider(container)
@@ -283,7 +293,7 @@ class MainActivity : AppCompatActivity() {
             toast("Pairing isn't implemented yet - pair from the TV's Settings first, then Connect above.")
         }, matchWrap())
 
-        dialog.show()
+        dialog?.show()
 
         // Any suggested IP found listening on 5555 connects to that device immediately on tap.
         scanForAdbDevices(
@@ -293,7 +303,7 @@ class MainActivity : AppCompatActivity() {
                     wirelessField.setText(ip)
                     remoteIp = ip; remotePort = 5555
                     connectNetwork(ip, 5555)
-                    dialog.dismiss()
+                    dialog?.dismiss()
                 }, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(4) })
             },
             onDone = { found ->
@@ -338,7 +348,7 @@ class MainActivity : AppCompatActivity() {
 
     // ─────────────────────────────── Remote control ───────────────────────────────
     private fun buildRemoteTab(root: LinearLayout) {
-        title(root, "TV remote")
+        title(root, "Remote")
         paragraph(root, "Use the Connect button at the top to pair with a TV over Wi-Fi or USB.")
         val pad = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER }
         pad.addView(button("Up") { sendKey(KeyEvent.UP) }, centeredParams(74))
@@ -368,7 +378,8 @@ class MainActivity : AppCompatActivity() {
                 val connection = AdbConnection(TcpTransport(host, port), crypto)
                 connection.connect()
                 adb?.close(); adb = connection
-                runOnUiThread { updateConnectionChip(); setStatus("Connected - $host:$port") }
+                resetIconPrefetchState()
+                runOnUiThread { updateConnectionChip(); setStatus("Connected - $host:$port; fetching app icons...") }
                 prefetchIconsAfterConnect()
             } catch (e: Exception) {
                 runOnUiThread { setStatus("Connection failed: ${e.message ?: e.javaClass.simpleName}") }
@@ -381,9 +392,9 @@ class MainActivity : AppCompatActivity() {
         val device: UsbDevice? = manager.deviceList.values.firstOrNull { UsbTransport.findAdbInterface(it) != null }
         if (device == null) { toast("No USB device with an ADB interface found. Check the OTG cable and USB debugging."); return }
         if (!manager.hasPermission(device)) {
-            val pi = PendingIntent.getBroadcast(this, 0, Intent("com.example.tvremote.USB_PERMISSION"), PendingIntent.FLAG_MUTABLE)
+            val pi = PendingIntent.getBroadcast(this, 0, Intent("com.min.adb.USB_PERMISSION"), PendingIntent.FLAG_MUTABLE)
             manager.requestPermission(device, pi)
-            toast("Grant the USB permission, then tap Connect USB again")
+            toast("Grant the USB permission, then tap Connect via USB again")
             return
         }
         setStatus("Connecting over USB...")
@@ -391,7 +402,8 @@ class MainActivity : AppCompatActivity() {
             try {
                 val connection = AdbConnection(UsbTransport(manager, device), crypto)
                 connection.connect(); adb?.close(); adb = connection
-                runOnUiThread { updateConnectionChip(); setStatus("Connected over USB") }
+                resetIconPrefetchState()
+                runOnUiThread { updateConnectionChip(); setStatus("Connected over USB; fetching app icons...") }
                 prefetchIconsAfterConnect()
             } catch (e: Exception) { runOnUiThread { setStatus("USB connection failed: ${e.message}") } }
         }
@@ -443,7 +455,7 @@ class MainActivity : AppCompatActivity() {
                     command = command.replace("{pkg}", shellQuote(pkg))
                 }
                 val cmd = command
-                val execute = { runShell(cmd) { result -> showOutputDialog(cmd, result) } }
+                val execute = { runCommand(cmd) { result -> showOutputDialog(cmd, result) } }
                 if (item.confirm) AlertDialog.Builder(this).setTitle("Confirm command")
                     .setMessage("${item.note}\n\n$cmd")
                     .setNegativeButton("Cancel", null).setPositiveButton("Run") { _, _ -> execute() }.show()
@@ -456,9 +468,9 @@ class MainActivity : AppCompatActivity() {
         title(root, "Custom command")
         val custom = edit(root, "Enter a shell command", "", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE)
         row(root, listOf(
-            "Run" to { val cmd = custom.text.toString().trim(); if (cmd.isNotEmpty()) runShell(cmd) { result -> showOutputDialog(cmd, result) } },
-            "Device info" to { runShell("getprop; echo '=== BATTERY ==='; dumpsys battery; echo '=== RAM ==='; cat /proc/meminfo; echo '=== STORAGE ==='; df -h /data") { result -> showOutputDialog("device info", result) } },
-            "Recent logcat" to { runShell("logcat -d -t 500") { result -> showOutputDialog("logcat -d -t 500", result) } }
+            "Run" to { val cmd = custom.text.toString().trim(); if (cmd.isNotEmpty()) runCommand(cmd) { result -> showOutputDialog(cmd, result) } },
+            "Device info" to { runCommand("getprop; echo '=== BATTERY ==='; dumpsys battery; echo '=== RAM ==='; cat /proc/meminfo; echo '=== STORAGE ==='; df -h /data") { result -> showOutputDialog("device info", result) } },
+            "Recent logcat" to { runCommand("logcat -d -t 500") { result -> showOutputDialog("logcat -d -t 500", result) } }
         ))
     }
 
@@ -520,7 +532,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun parsePackageList(raw: String, filter: String): List<String> =
-        raw.lineSequence().map { it.trim().removePrefix("package:") }
+        raw.lineSequence().map { it.trim() }.filter { it.startsWith("package:") }.map { it.removePrefix("package:") }
             .filter { it.isNotBlank() && it.contains(filter, ignoreCase = true) }.distinct().sorted().toList()
 
     /** User apps first, system apps after - each group sorted alphabetically within itself. */
@@ -574,21 +586,21 @@ class MainActivity : AppCompatActivity() {
             addView(header, matchWrap())
         }
         val actionsTop = ui.actionRow(
-            ui.pill("Launch") { runShell("monkey -p ${shellQuote(pkg)} -c android.intent.category.LAUNCHER 1") { setStatus(it.ifBlank { "Launch request sent for $pkg" }) } },
-            ui.pill("Stop") { runShell("am force-stop ${shellQuote(pkg)}") { setStatus(it.ifBlank { "Force-stop sent for $pkg" }) } }
+            ui.pill("Launch") { runCommand("monkey -p ${shellQuote(pkg)} -c android.intent.category.LAUNCHER 1") { setStatus(it.ifBlank { "Launch request sent for $pkg" }) } },
+            ui.pill("Stop") { runCommand("am force-stop ${shellQuote(pkg)}") { setStatus(it.ifBlank { "Force-stop sent for $pkg" }) } }
         )
         val actionsBottom = ui.actionRow(
-            ui.pill("Enable") { runShell("pm enable ${shellQuote(pkg)}") { setStatus(it.ifBlank { "Enable sent for $pkg" }) } },
+            ui.pill("Enable") { runCommand("pm enable ${shellQuote(pkg)}") { setStatus(it.ifBlank { "Enable sent for $pkg" }) } },
             ui.pill("Disable") {
                 AlertDialog.Builder(this).setTitle("Disable $pkg?").setMessage("Disabling a system package can break TV features until re-enabled.")
                     .setNegativeButton("Cancel", null).setPositiveButton("Disable") { _, _ ->
-                        runShell("pm disable-user --user 0 ${shellQuote(pkg)}") { setStatus(it.ifBlank { "Disable sent for $pkg" }) }
+                        runCommand("pm disable-user --user 0 ${shellQuote(pkg)}") { setStatus(it.ifBlank { "Disable sent for $pkg" }) }
                     }.show()
             },
             ui.pill("Uninstall") {
                 AlertDialog.Builder(this).setTitle("Uninstall $pkg?").setMessage("Uninstall $pkg for the current user on the target device?")
                     .setNegativeButton("Cancel", null).setPositiveButton("Uninstall") { _, _ ->
-                        runShell("pm uninstall --user 0 ${shellQuote(pkg)}") { setStatus(it); refreshPackages(listOwner) }
+                        runCommand("pm uninstall --user 0 ${shellQuote(pkg)}") { setStatus(it); refreshPackages(listOwner) }
                     }.show()
             }
         )
@@ -607,11 +619,24 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ──────────────────────── Fast bulk icon/label fetch via the on-device helper ────────────────────────
-    private val HELPER_PKG = "com.example.tvremote.iconhelper"
-    private val HELPER_ACTION = "com.example.tvremote.iconhelper.DUMP_ICONS"
-    private val HELPER_REMOTE_DIR = "/sdcard/tvremote_icons"
+    private val HELPER_PKG = "com.min.adb.iconhelper"
+    private val HELPER_ACTION = "com.min.adb.iconhelper.DUMP_ICONS"
+    private val HELPER_REMOTE_DIR = "/sdcard/adb_icons"
     private val bulkIconCache = HashMap<String, Pair<String?, Bitmap?>>()
     @Volatile private var iconsPrefetched = false
+    @Volatile private var bulkIconError: String? = null
+    // Connection-time prefetch and the Packages screen can request icons at almost the same
+    // time. Keep one pull in flight and deliver its result to every caller.
+    private var iconFetchInProgress = false
+    private val iconFetchCallbacks = mutableListOf<(Map<String, Pair<String?, Bitmap?>>) -> Unit>()
+
+    private fun resetIconPrefetchState() {
+        synchronized(bulkIconCache) {
+            bulkIconCache.clear()
+            iconsPrefetched = false
+            bulkIconError = null
+        }
+    }
 
     /** Installs (once) a tiny headless helper app on the TV that reads every icon/label straight
      *  from its own on-device PackageManager - no per-app APK pulls needed. It writes small PNGs
@@ -621,44 +646,69 @@ class MainActivity : AppCompatActivity() {
     private fun bulkFetchIcons(onResult: (Map<String, Pair<String?, Bitmap?>>) -> Unit) {
         synchronized(bulkIconCache) {
             if (iconsPrefetched) {
-                onResult(HashMap(bulkIconCache))
+                val cached = HashMap(bulkIconCache)
+                runOnUiThread { onResult(cached) }
                 return
             }
+            iconFetchCallbacks.add(onResult)
+            if (iconFetchInProgress) return
+            iconFetchInProgress = true
         }
+
         val connection = adb
-        if (connection == null) { onResult(emptyMap()); return }
+        if (connection == null) {
+            finishIconFetch(emptyMap(), "Not connected to ADB")
+            return
+        }
         thread(name = "adb-bulk-icons") {
             val result = HashMap<String, Pair<String?, Bitmap?>>()
+            var error: String? = null
             try {
-                // 1) Make sure the headless helper app is installed on the TV.
+                // 1) Ensure the helper is installed. The APK is bundled by copyIconHelperApk
+                // during the normal Gradle preBuild task.
                 val pathCheck = connection.shell("pm path $HELPER_PKG")
-                if (!pathCheck.contains("package:")) {
+                val installedVersionLine = if (pathCheck.contains("package:")) {
+                    connection.shell("dumpsys package $HELPER_PKG | grep versionCode")
+                } else ""
+                val installedVersion = Regex("versionCode=(\\d+)").find(installedVersionLine)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                // Version 2 adds QUERY_ALL_PACKAGES. Replace an older helper so an installation
+                // from a previous build cannot silently keep returning a filtered package list.
+                if (installedVersion < 2) {
+                    if (installedVersion > 0) connection.shell("pm uninstall $HELPER_PKG")
                     val apk = File(cacheDir, "iconhelper.apk")
                     assets.open("iconhelper.apk").use { input -> apk.outputStream().use { input.copyTo(it) } }
-                    AdbSyncClient(connection).push(apk.inputStream(), "/data/local/tmp/iconhelper.apk")
-                    val install = connection.shell("pm install -r /data/local/tmp/iconhelper.apk")
-                    if (!install.contains("Success")) throw IOException("helper install failed: $install")
+                    FileInputStream(apk).use { input -> AdbSyncClient(connection).push(input, "/data/local/tmp/iconhelper.apk") }
+                    val install = connection.shell("pm install -r -g /data/local/tmp/iconhelper.apk")
                     apk.delete()
+                    if (!install.contains("Success", ignoreCase = true)) throw IOException("helper install failed: $install")
                 }
 
-                // 2) Trigger the dump (headless - no UI appears on the TV) and wait for it to finish.
+                // 2) Clear stale files, explicitly target the receiver, and wait for DONE.
                 connection.shell("rm -rf $HELPER_REMOTE_DIR")
-                connection.shell("am broadcast -a $HELPER_ACTION")
-                var waited = 0
-                while (waited < 20_000) {
-                    val done = connection.shell("ls $HELPER_REMOTE_DIR/DONE 2>/dev/null")
-                    if (done.contains("DONE")) break
-                    Thread.sleep(400); waited += 400
+                val broadcast = connection.shell("am broadcast -n $HELPER_PKG/.DumpReceiver -a $HELPER_ACTION")
+                if (broadcast.contains("Error", ignoreCase = true) || broadcast.contains("not found", ignoreCase = true)) {
+                    throw IOException("could not start icon helper: $broadcast")
                 }
+                var waited = 0
+                var completed = false
+                while (waited < 30_000) {
+                    val done = connection.shell("test -f $HELPER_REMOTE_DIR/DONE && echo DONE")
+                    if (done.contains("DONE")) { completed = true; break }
+                    Thread.sleep(400)
+                    waited += 400
+                }
+                if (!completed) throw IOException("icon helper timed out (no DONE file)")
 
-                // 3) Pack everything into one tar on-device and pull that single file.
+                // 3) Create one archive and pull it to the phone in a single ADB sync transfer.
                 val remoteTar = "$HELPER_REMOTE_DIR.tar"
-                connection.shell("tar -cf $remoteTar -C $HELPER_REMOTE_DIR .")
-                val localTar = File(cacheDir, "tvremote_icons.tar")
+                val tarResult = connection.shell("tar -cf $remoteTar -C $HELPER_REMOTE_DIR .")
+                val tarCheck = connection.shell("test -s $remoteTar && echo TAR_OK")
+                if (!tarCheck.contains("TAR_OK")) throw IOException("could not create icon archive: $tarResult")
+                val localTar = File(cacheDir, "adb_icons.tar")
                 FileOutputStream(localTar).use { out -> AdbSyncClient(connection).pull(remoteTar, out) }
                 connection.shell("rm -rf $HELPER_REMOTE_DIR $remoteTar")
 
-                // 4) Extract locally and decode.
+                // 4) Decode the pulled PNGs and their labels into the in-memory icon cache.
                 val entries = untar(localTar)
                 localTar.delete()
                 val manifest = entries["manifest.csv"]?.toString(Charsets.UTF_8).orEmpty()
@@ -669,20 +719,29 @@ class MainActivity : AppCompatActivity() {
                 for ((name, bytes) in entries) {
                     if (!name.endsWith(".png")) continue
                     val pkg = name.removeSuffix(".png")
-                    val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: continue
                     result[pkg] = labels[pkg] to bmp
                 }
+                if (result.isEmpty()) throw IOException("helper completed but returned no icons")
             } catch (e: Exception) {
-                // Bulk path failed (no tar binary, install blocked, etc.) - leave result as-is;
-                // whatever's missing falls back to the per-app pull in renderPackageRows.
+                error = e.message ?: e.javaClass.simpleName
             }
-            synchronized(bulkIconCache) {
-                bulkIconCache.clear()
-                bulkIconCache.putAll(result)
-                iconsPrefetched = true
-            }
-            runOnUiThread { onResult(result) }
+            finishIconFetch(result, error)
         }
+    }
+
+    private fun finishIconFetch(result: Map<String, Pair<String?, Bitmap?>>, error: String?) {
+        val callbacks: List<(Map<String, Pair<String?, Bitmap?>>) -> Unit>
+        synchronized(bulkIconCache) {
+            bulkIconCache.clear()
+            bulkIconCache.putAll(result)
+            iconsPrefetched = result.isNotEmpty()
+            bulkIconError = error
+            iconFetchInProgress = false
+            callbacks = iconFetchCallbacks.toList()
+            iconFetchCallbacks.clear()
+        }
+        runOnUiThread { callbacks.forEach { callback -> runCatching { callback(result) } } }
     }
 
     /** Fetch icons immediately after ADB connects, so the package icons are ready before
@@ -691,7 +750,14 @@ class MainActivity : AppCompatActivity() {
         synchronized(bulkIconCache) {
             if (iconsPrefetched) return
         }
-        bulkFetchIcons { /* cached for the Packages tab */ }
+        bulkFetchIcons { result ->
+            if (result.isNotEmpty()) {
+                setStatus("ADB connected — ${result.size} app icons fetched")
+            } else {
+                val detail = bulkIconError?.let { ": $it" }.orEmpty()
+                setStatus("ADB connected, but icon prefetch failed$detail. Open Packages to retry.")
+            }
+        }
     }
 
     /** Minimal reader for the flat POSIX ustar files Android's toybox `tar` produces here - just
@@ -997,9 +1063,89 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Runs a user-visible command and tracks its exit status (appends `echo $?`). On success
+     * [onSuccess] gets the output; on failure NOTHING is shown over the app except the in-app
+     * toast at the top, so a failed command can never cover the UI with an output dialog.
+     */
+    private fun runCommand(command: String, onSuccess: (String) -> Unit) {
+        val connection = adb
+        if (connection == null) { toast("Failed: not connected to an ADB device", error = true); return }
+        thread(name = "adb-command") {
+            var ok = true
+            var output = ""
+            var reason = ""
+            try {
+                val stream = connection.open("shell:$command\necho \"$RC_MARK\$?\"")
+                val raw = stream.readAllText(60_000)
+                val remoteClosed = stream.closed
+                runCatching { stream.close() }
+                val idx = raw.lastIndexOf(RC_MARK)
+                if (idx >= 0) {
+                    val rc = raw.substring(idx + RC_MARK.length).trim().toIntOrNull() ?: 0
+                    output = raw.substring(0, idx).trimEnd().take(8_000_000)
+                    if (rc != 0) { ok = false; reason = "exit $rc" }
+                } else {
+                    output = raw.take(8_000_000)
+                    // No marker: fine if the device closed the stream itself (reboot, power off...),
+                    // but if it's still open we just ran out of patience.
+                    if (!remoteClosed) { ok = false; reason = "timed out after 60s without output" }
+                }
+            } catch (e: Exception) {
+                ok = false; reason = e.message ?: e.javaClass.simpleName
+            }
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                if (ok) onSuccess(output.ifBlank { "(no output)" })
+                else {
+                    val hint = output.lineSequence().firstOrNull { it.isNotBlank() }?.trim()?.take(80)
+                    toast("Failed ($reason)" + (hint?.let { ": $it" } ?: ""), error = true)
+                }
+            }
+        }
+    }
+
     private fun requireAdb(): AdbConnection = adb ?: throw IOException("Not connected")
     private fun setStatus(value: String) { statusView.text = value }
-    private fun toast(value: String) = Toast.makeText(this, value, Toast.LENGTH_SHORT).show()
+
+    /** In-app toast pinned to the top of this Activity's own view tree (not android.widget.Toast),
+     *  so it disappears with the app: removed on pause/stop/destroy instead of lingering. */
+    private fun toast(value: String, error: Boolean = false) {
+        if (!::rootFrame.isInitialized) return
+        dismissToast()
+        val view = TextView(this).apply {
+            text = value
+            textSize = 14f
+            maxLines = 3
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setPadding(dp(18), dp(12), dp(18), dp(12))
+            setTextColor(color(if (error) R.color.md_on_error_container else R.color.md_on_secondary_container))
+            background = ui.pillBg(if (error) R.color.md_error_container else R.color.md_secondary_container, 20)
+            elevation = dp(10).toFloat()
+            isClickable = true
+            setOnClickListener { dismissToast() }
+            alpha = 0f
+            translationY = -dp(16).toFloat()
+        }
+        rootFrame.addView(view, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            topMargin = dp(16); marginStart = dp(16); marginEnd = dp(16)
+        })
+        view.animate().alpha(1f).translationY(0f).setDuration(180).start()
+        toastView = view
+        handler.postDelayed(toastHide, if (error) 3500 else 2500)
+    }
+
+    private fun dismissToast() {
+        handler.removeCallbacks(toastHide)
+        toastView?.let { v -> v.animate().cancel(); rootFrame.removeView(v) }
+        toastView = null
+    }
+
+    override fun onPause() {
+        dismissToast()
+        super.onPause()
+    }
     private fun shellQuote(value: String): String = "'" + value.replace("'", "'\\''") + "'"
     private fun joinRemote(parent: String, child: String): String = (parent.trimEnd('/') + "/" + child.trimStart('/')).ifBlank { "/" }
     private fun parentPath(path: String): String = path.trimEnd('/').substringBeforeLast('/', "").ifBlank { "/" }
@@ -1076,6 +1222,7 @@ class MainActivity : AppCompatActivity() {
         // Without this, auto-refresh screenshots keep firing via `handler` and the ADB
         // socket/read-thread in `adb` stay alive after the Activity is gone.
         screenAuto = false
+        dismissToast()
         handler.removeCallbacksAndMessages(null)
         thread { runCatching { adb?.close() } }
     }
@@ -1089,6 +1236,7 @@ class MainActivity : AppCompatActivity() {
         private const val TAB_SCREEN = 4
         private const val TAB_FILES = 5
 
+        private const val RC_MARK = "__ADB_RC__"
         private const val REQUEST_PUSH_FILE = 2001
         private const val REQUEST_PULL_FILE = 2002
         private const val REQUEST_SAVE_SCREEN = 2003

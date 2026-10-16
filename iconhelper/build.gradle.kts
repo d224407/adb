@@ -4,18 +4,18 @@ plugins {
 }
 
 android {
-    namespace = "com.example.tvremote.iconhelper"
+    namespace = "com.min.adb.iconhelper"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.example.tvremote.iconhelper"
+        applicationId = "com.min.adb.iconhelper"
         minSdk = 21
         // Deliberately staying on the legacy (pre-scoped) storage model so writing to /sdcard
         // just needs the normal WRITE_EXTERNAL_STORAGE permission, granted silently via
         // `pm grant`/install-time grant - no runtime permission dialog ever appears on the TV.
         targetSdk = 28
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
     }
 
     compileOptions {

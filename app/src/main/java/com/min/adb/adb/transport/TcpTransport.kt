@@ -1,4 +1,4 @@
-package com.example.tvremote.adb.transport
+package com.min.adb.adb.transport
 
 import java.net.InetSocketAddress
 import java.net.Socket
