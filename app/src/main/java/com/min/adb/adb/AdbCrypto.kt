@@ -11,6 +11,23 @@ import java.security.KeyPairGenerator
 import java.security.spec.PKCS8EncodedKeySpec
 import java.security.spec.X509EncodedKeySpec
 import javax.crypto.Cipher
+import java.io.ByteArrayInputStream
+import java.net.Socket
+import java.security.Principal
+import java.security.PrivateKey
+import java.security.SecureRandom
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
+import java.util.Date
+import java.util.Locale
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLEngine
+import javax.net.ssl.X509ExtendedKeyManager
+import javax.net.ssl.X509ExtendedTrustManager
+import org.bouncycastle.asn1.x500.X500Name
+import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo
+import org.bouncycastle.cert.X509v3CertificateBuilder
+import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
 import java.security.KeyPair
 import java.security.interfaces.RSAPrivateKey
 import java.security.interfaces.RSAPublicKey
@@ -45,6 +62,48 @@ class AdbCrypto private constructor(val keyPair: KeyPair) {
         val b64 = Base64.encodeToString(encoded, Base64.NO_WRAP)
         return "$b64 $deviceLabel\u0000".toByteArray(Charsets.UTF_8)
     }
+
+    private val certificate: X509Certificate by lazy {
+        // Self-signed cert over our own RSA key: adbd matches the client's public key against the
+        // keys it trusts (added by pairing, or by tapping "Allow"), it doesn't validate a CA chain.
+        val signer = JcaContentSignerBuilder("SHA256withRSA").build(keyPair.private)
+        val holder = X509v3CertificateBuilder(
+            X500Name("CN=00"), BigInteger.ONE, Date(0), Date(2461449600L * 1000), Locale.ROOT,
+            X500Name("CN=00"), SubjectPublicKeyInfo.getInstance(keyPair.public.encoded)
+        ).build(signer)
+        CertificateFactory.getInstance("X.509").generateCertificate(ByteArrayInputStream(holder.encoded)) as X509Certificate
+    }
+
+    private val tlsContext: SSLContext by lazy {
+        val keyManager = object : X509ExtendedKeyManager() {
+            private val alias = "key"
+            override fun chooseClientAlias(keyTypes: Array<out String>, issuers: Array<out Principal>?, socket: Socket?): String? =
+                if (keyTypes.contains("RSA")) alias else null
+            override fun getCertificateChain(alias: String?): Array<X509Certificate>? =
+                if (alias == this.alias) arrayOf(certificate) else null
+            override fun getPrivateKey(alias: String?): PrivateKey? = if (alias == this.alias) keyPair.private else null
+            override fun getClientAliases(keyType: String?, issuers: Array<out Principal>?): Array<String>? = null
+            override fun getServerAliases(keyType: String, issuers: Array<out Principal>?): Array<String>? = null
+            override fun chooseServerAlias(keyType: String, issuers: Array<out Principal>?, socket: Socket?): String? = null
+        }
+        // The device presents a self-signed cert too; trust is established by pairing, not by PKI.
+        val trustAll = @android.annotation.SuppressLint("CustomX509TrustManager") object : X509ExtendedTrustManager() {
+            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?, socket: Socket?) {}
+            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?, engine: SSLEngine?) {}
+            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?, socket: Socket?) {}
+            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?, engine: SSLEngine?) {}
+            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+            override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+        }
+        // Bundled Conscrypt gives TLS 1.3 + exportKeyingMaterial on every API level we support.
+        SSLContext.getInstance("TLSv1.3", org.conscrypt.Conscrypt.newProvider()).apply {
+            init(arrayOf(keyManager), arrayOf(trustAll), SecureRandom())
+        }
+    }
+
+    /** TLS context presenting our ADB key as the client certificate (pairing + "adb connect" over TLS). */
+    fun sslContext(): SSLContext = tlsContext
 
     companion object {
         private const val FILE_PRIV = "adb_key_priv"

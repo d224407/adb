@@ -37,6 +37,11 @@ class AdbConnection(private val transport: Transport, private val crypto: AdbCry
 
             when (msg.command) {
                 AdbProtocol.A_CNXN -> connected = true
+                AdbProtocol.A_STLS -> {
+                    // Wireless-debugging port: device wants TLS. Reply, upgrade, then it sends CNXN over TLS.
+                    transport.write(AdbProtocol.generateMessage(AdbProtocol.A_STLS, AdbProtocol.A_STLS_VERSION, 0))
+                    transport.startTls(crypto.sslContext())
+                }
                 AdbProtocol.A_AUTH -> {
                     if (msg.arg0 == AdbProtocol.AUTH_TOKEN) {
                         if (!signedAlready) {
