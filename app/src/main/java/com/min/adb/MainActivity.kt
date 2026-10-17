@@ -94,7 +94,12 @@ class MainActivity : AppCompatActivity() {
         crypto = AdbCrypto.loadOrGenerate(this)
         buildShellUi()
         renderTab(TAB_PACKAGES)
+        // Re-connect to the last device on first launch (only ever saved for port 5555).
+        val last = prefs.getString(PREF_LAST_HOST, null)
+        if (!last.isNullOrBlank()) { remoteIp = last; connectNetwork(last, 5555) }
     }
+
+    private val prefs by lazy { getSharedPreferences("adb_prefs", MODE_PRIVATE) }
 
     private fun buildShellUi() {
         // Outer frame: scrollable content behind a floating pill nav bar, same layering as
@@ -173,6 +178,26 @@ class MainActivity : AppCompatActivity() {
                 bottomMargin = dp(16)
             }
         )
+        // Rounded-square "+" (sideload APK), floating just above the bottom pill nav bar.
+        val fabRadius = dp(18).toFloat()
+        val fab = TextView(this).apply {
+            text = "+"
+            textSize = 30f
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            setTextColor(color(R.color.md_on_primary_container))
+            background = ui.stateBg(R.color.md_primary_container, FloatArray(8) { fabRadius })
+            elevation = dp(6).toFloat()
+            isFocusable = true
+            isClickable = true
+            contentDescription = "Sideload APK"
+            setOnClickListener { openSideloadChooser() }
+        }.withPressAnimation()
+        frame.addView(fab, FrameLayout.LayoutParams(dp(56), dp(56)).apply {
+            gravity = Gravity.BOTTOM or Gravity.END
+            bottomMargin = dp(16 + 56 + 12)
+            marginEnd = dp(16)
+        })
         setContentView(frame)
         updateTabHighlight()
         updateConnectionChip()
@@ -192,7 +217,7 @@ class MainActivity : AppCompatActivity() {
         val body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             // Extra bottom padding so content can scroll clear of the floating pill nav bar.
-            setPadding(dp(16), dp(14), dp(16), dp(96))
+            setPadding(dp(16), dp(14), dp(16), dp(170))
         }
         scroll.addView(body)
         content.addView(scroll)
@@ -257,14 +282,14 @@ class MainActivity : AppCompatActivity() {
         divider(container)
         container.addView(ui.label("Wireless debugging", 14f, R.color.md_on_surface, bold = true), matchWrap())
 
-        val scanStatus = ui.label("Scanning the local network for port 5555...", 13f, R.color.md_on_surface_variant)
+        val scanStatus = ui.label("Scanning for port 5555...", 13f, R.color.md_on_surface_variant)
         container.addView(scanStatus, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
         val suggestions = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         container.addView(suggestions, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6); bottomMargin = dp(6) })
 
         // IP only - no port field. Normal Wireless Debugging devices listen on 5555, so that's
         // always what's used to connect; no need to ask for it.
-        val wirelessField = edit(container, "TV IP address", remoteIp, InputType.TYPE_CLASS_TEXT)
+        val wirelessField = edit(container, "Device IP (or IP:port for Wireless debugging)", if (remoteIp.isNotBlank()) remoteIp else "", InputType.TYPE_CLASS_TEXT)
 
         val cancelled = AtomicBoolean(false)
         dialog = AlertDialog.Builder(this)
@@ -275,10 +300,10 @@ class MainActivity : AppCompatActivity() {
             .create()
 
         container.addView(ui.pill("Connect", primary = true) {
-            val host = wirelessField.text.toString().trim()
-            if (host.isBlank()) { toast("Enter the TV's IP address"); return@pill }
-            remoteIp = host; remotePort = 5555
-            connectNetwork(host, 5555)
+            val (host, port) = parseHostPort(wirelessField.text.toString())
+            if (host.isBlank()) { toast("Enter the device's IP address", error = true); return@pill }
+            remoteIp = host; remotePort = port
+            connectNetwork(host, port)
             dialog?.dismiss()
         }, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4); bottomMargin = dp(8) })
 
@@ -287,12 +312,14 @@ class MainActivity : AppCompatActivity() {
         val pairIp = edit(container, "Pairing IP:port (shown on the TV)", "", InputType.TYPE_CLASS_TEXT)
         val pairCode = edit(container, "6-digit pairing code", "", InputType.TYPE_CLASS_NUMBER)
         container.addView(ui.label(
-            "Pairing uses a different, TLS-based handshake from a normal ADB connection and isn't implemented in this build yet. Pair the TV from its own Settings first, then use the field above with the IP it ends up listening on.",
+            "Wireless debugging > Pair device with pairing code. Enter the IP:port and code shown there, then connect above.",
             12.5f, R.color.md_on_surface_variant
         ).apply { setPadding(0, dp(2), 0, dp(6)) }, matchWrap())
         container.addView(ui.pill("Pair") {
-            if (pairIp.text.toString().isBlank() || pairCode.text.toString().isBlank()) { toast("Enter the pairing IP:port and the 6-digit code"); return@pill }
-            toast("Pairing isn't implemented yet - pair from the TV's Settings first, then Connect above.")
+            val (pHost, pPort) = parseHostPort(pairIp.text.toString(), defaultPort = -1)
+            val code = pairCode.text.toString().trim()
+            if (pHost.isBlank() || pPort <= 0 || code.length != 6) { toast("Enter the pairing IP:port and the 6-digit code", error = true); return@pill }
+            pairDevice(pHost, pPort, code) { dialog?.dismiss() }
         }, matchWrap())
 
         dialog?.show()
@@ -351,7 +378,7 @@ class MainActivity : AppCompatActivity() {
     // ─────────────────────────────── Remote control ───────────────────────────────
     private fun buildRemoteTab(root: LinearLayout) {
         title(root, "Remote")
-        paragraph(root, "Use the Connect button at the top to pair with a TV over Wi-Fi or USB.")
+        paragraph(root, "Connect first, then use the pad.")
         val pad = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER }
         pad.addView(button("Up") { sendKey(KeyEvent.UP) }, centeredParams(74))
         val middle = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
@@ -372,6 +399,39 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** "192.168.1.5" -> (host, 5555); "192.168.1.5:37123" -> (host, 37123). */
+    private fun parseHostPort(text: String, defaultPort: Int = 5555): Pair<String, Int> {
+        val t = text.trim()
+        val idx = t.lastIndexOf(':')
+        if (idx > 0) {
+            val port = t.substring(idx + 1).toIntOrNull()
+            if (port != null && port in 1..65535) return t.substring(0, idx).trim() to port
+        }
+        return t to defaultPort
+    }
+
+    private fun pairDevice(host: String, port: Int, code: String, onDone: () -> Unit) {
+        toast("Pairing with $host:$port...", durationMs = 30_000L)
+        thread(name = "adb-pairing") {
+            var message = ""
+            var error = true
+            try {
+                com.min.adb.adb.AdbPairingClient(host, port, code, crypto).use { it.pair() }
+                message = "Paired with $host. Now connect to it."
+                error = false
+            } catch (e: com.min.adb.adb.AdbWrongPairingCodeException) {
+                message = "Pairing failed: wrong pairing code"
+            } catch (e: Throwable) {
+                message = "Pairing failed: ${e.message ?: e.javaClass.simpleName}"
+            }
+            runOnUiThread {
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                toast(message, error = error, durationMs = 4000L)
+                if (!error) { remoteIp = host; onDone() }
+            }
+        }
+    }
+
     private fun connectNetwork(host: String, port: Int) {
         if (host.isBlank()) { toast("Enter the TV's IP address"); return }
         setStatus("Connecting to $host:$port...")
@@ -381,7 +441,12 @@ class MainActivity : AppCompatActivity() {
                 connection.connect()
                 adb?.close(); adb = connection
                 resetIconPrefetchState()
-                runOnUiThread { updateConnectionChip(); setStatus("Connected - $host:$port; fetching app icons...") }
+                if (port == 5555) prefs.edit().putString(PREF_LAST_HOST, host).apply()
+                runOnUiThread {
+                    updateConnectionChip(); setStatus("Connected - $host:$port; fetching app icons...")
+                    // Load packages (and icons) right away instead of waiting for a manual Refresh.
+                    if (selectedTab == TAB_PACKAGES) renderTab(TAB_PACKAGES)
+                }
                 prefetchIconsAfterConnect()
             } catch (e: Exception) {
                 runOnUiThread { setStatus("Connection failed: ${e.message ?: e.javaClass.simpleName}") }
@@ -405,7 +470,10 @@ class MainActivity : AppCompatActivity() {
                 val connection = AdbConnection(UsbTransport(manager, device), crypto)
                 connection.connect(); adb?.close(); adb = connection
                 resetIconPrefetchState()
-                runOnUiThread { updateConnectionChip(); setStatus("Connected over USB; fetching app icons...") }
+                runOnUiThread {
+                    updateConnectionChip(); setStatus("Connected over USB; fetching app icons...")
+                    if (selectedTab == TAB_PACKAGES) renderTab(TAB_PACKAGES)
+                }
                 prefetchIconsAfterConnect()
             } catch (e: Exception) { runOnUiThread { setStatus("USB connection failed: ${e.message}") } }
         }
@@ -846,7 +914,7 @@ class MainActivity : AppCompatActivity() {
     // ─────────────────────────────────── Processes ───────────────────────────────────
     private fun buildProcessesTab(root: LinearLayout) {
         title(root, "Processes")
-        paragraph(root, "Main source: ps -A. Columns and access can differ by Android version/ROM. Live CPU usage isn't computed in this build.")
+        paragraph(root, "From ps -A. Columns vary by Android version.")
         row(root, listOf("Refresh" to { refreshProcesses() }, "RAM info" to { runShell("cat /proc/meminfo") { processRaw = it; renderProcessOutput() } }))
         processFilter = edit(root, "Filter by PID / user / process name", "", InputType.TYPE_CLASS_TEXT)
         val out = outputView(root, "Tap Refresh to fetch the process list")
@@ -882,7 +950,7 @@ class MainActivity : AppCompatActivity() {
     // ─────────────────────────────────── Screen capture / polling mirror ───────────────────────────────────
     private fun buildScreenTab(root: LinearLayout) {
         title(root, "Screen")
-        paragraph(root, "This mode polls screencap periodically; it is not a low-latency scrcpy video stream. Requires screencap/base64 on the target device.")
+        paragraph(root, "Polls screencap; not a live stream. Needs base64 on the device.")
         val image = ImageView(this).apply {
             adjustViewBounds = true
             scaleType = ImageView.ScaleType.FIT_CENTER
@@ -932,7 +1000,7 @@ class MainActivity : AppCompatActivity() {
     // ─────────────────────────────────── File manager / ADB SYNC ───────────────────────────────────
     private fun buildFilesTab(root: LinearLayout) {
         title(root, "Files")
-        paragraph(root, "Browse directories, create/delete folders and transfer files over ADB SYNC. Access is still governed by Android.")
+        paragraph(root, "Browse and transfer files over ADB SYNC.")
         val path = edit(root, "Path on the TV", "/sdcard", InputType.TYPE_CLASS_TEXT)
         filePathEdit = path
         row(root, listOf(
@@ -1042,6 +1110,11 @@ class MainActivity : AppCompatActivity() {
         when (requestCode) {
             REQUEST_PUSH_FILE -> if (uri != null) transferPush(uri)
             REQUEST_PULL_FILE -> if (uri != null) transferPull(uri)
+            REQUEST_SIDELOAD -> {
+                val clip = data?.clipData
+                val uris = if (clip != null) (0 until clip.itemCount).map { clip.getItemAt(it).uri } else listOfNotNull(uri)
+                sideloadUris(uris)
+            }
             REQUEST_SAVE_SCREEN -> if (uri != null) {
                 val bytes = pendingScreenshot ?: return
                 thread { runCatching { contentResolver.openOutputStream(uri)?.use { it.write(bytes) } }
@@ -1070,40 +1143,195 @@ class MainActivity : AppCompatActivity() {
      * [onSuccess] gets the output; on failure NOTHING is shown over the app except the in-app
      * toast at the top, so a failed command can never cover the UI with an output dialog.
      */
+    private class CmdResult(val output: String, val ok: Boolean, val reason: String)
+
+    /** Blocking: runs [command] on the device and reports output + exit status. Call off the UI thread. */
+    private fun execCommand(connection: AdbConnection, command: String, timeoutMs: Long = 60_000): CmdResult {
+        return try {
+            val stream = connection.open("shell:$command\necho \"$RC_MARK\$?\"")
+            val raw = stream.readAllText(timeoutMs)
+            val remoteClosed = stream.closed
+            runCatching { stream.close() }
+            val idx = raw.lastIndexOf(RC_MARK)
+            if (idx >= 0) {
+                val rc = raw.substring(idx + RC_MARK.length).trim().toIntOrNull() ?: 0
+                CmdResult(raw.substring(0, idx).trimEnd().take(8_000_000), rc == 0, if (rc == 0) "" else "exit $rc")
+            } else {
+                // No marker: fine if the device closed the stream itself (reboot, power off...),
+                // but if it's still open we just ran out of patience.
+                CmdResult(raw.take(8_000_000), remoteClosed, if (remoteClosed) "" else "timed out after ${timeoutMs / 1000}s without output")
+            }
+        } catch (e: Exception) {
+            CmdResult("", false, e.message ?: e.javaClass.simpleName)
+        }
+    }
+
     private fun runCommand(command: String, onSuccess: (String) -> Unit) {
         val connection = adb
         if (connection == null) { toast("Failed: not connected to an ADB device", error = true); return }
         thread(name = "adb-command") {
-            var ok = true
-            var output = ""
-            var reason = ""
-            try {
-                val stream = connection.open("shell:$command\necho \"$RC_MARK\$?\"")
-                val raw = stream.readAllText(60_000)
-                val remoteClosed = stream.closed
-                runCatching { stream.close() }
-                val idx = raw.lastIndexOf(RC_MARK)
-                if (idx >= 0) {
-                    val rc = raw.substring(idx + RC_MARK.length).trim().toIntOrNull() ?: 0
-                    output = raw.substring(0, idx).trimEnd().take(8_000_000)
-                    if (rc != 0) { ok = false; reason = "exit $rc" }
-                } else {
-                    output = raw.take(8_000_000)
-                    // No marker: fine if the device closed the stream itself (reboot, power off...),
-                    // but if it's still open we just ran out of patience.
-                    if (!remoteClosed) { ok = false; reason = "timed out after 60s without output" }
-                }
-            } catch (e: Exception) {
-                ok = false; reason = e.message ?: e.javaClass.simpleName
-            }
+            val r = execCommand(connection, command)
             runOnUiThread {
                 if (isFinishing || isDestroyed) return@runOnUiThread
-                if (ok) onSuccess(output.ifBlank { "(no output)" })
+                if (r.ok) onSuccess(r.output.ifBlank { "(no output)" })
                 else {
-                    val hint = output.lineSequence().firstOrNull { it.isNotBlank() }?.trim()?.take(80)
-                    toast("Failed ($reason)" + (hint?.let { ": $it" } ?: ""), error = true)
+                    val hint = r.output.lineSequence().firstOrNull { it.isNotBlank() }?.trim()?.take(80)
+                    toast("Failed (${r.reason})" + (hint?.let { ": $it" } ?: ""), error = true)
                 }
             }
+        }
+    }
+
+    // ─────────────────────────────────── Sideload APK ───────────────────────────────────
+    private class ApkSource(val name: String, val open: () -> java.io.InputStream)
+    private val sideloading = AtomicBoolean(false)
+    private fun isArchive(name: String) = name.lowercase().let { it.endsWith(".apks") || it.endsWith(".apkm") || it.endsWith(".xapk") || it.endsWith(".zip") }
+
+    /** Skips ABI config splits that don't match the target device (e.g. x86 splits on an arm64 TV). */
+    private fun abiAllowed(entryName: String, deviceAbis: List<String>): Boolean {
+        val m = Regex("config\\.(arm64_v8a|armeabi_v7a|x86_64|x86|armeabi)\\.apk$").find(entryName.lowercase().replace('-', '_')) ?: return true
+        return deviceAbis.isEmpty() || m.groupValues[1] in deviceAbis
+    }
+
+    private fun openSideloadChooser() {
+        if (adb == null) { toast("Failed: connect to a device first", error = true); return }
+        AlertDialog.Builder(this).setTitle("Sideload APK")
+            .setItems(arrayOf("From phone storage (APK / APKS / APKM / XAPK)", "From installed apps on this phone")) { _, which ->
+                if (which == 0) pickApkFiles() else pickInstalledApp()
+            }.setNegativeButton("Cancel", null).show()
+    }
+
+    private fun pickApkFiles() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true) // select base + split APKs together
+        }
+        startActivityForResult(intent, REQUEST_SIDELOAD)
+    }
+
+    private fun sideloadUris(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val sources = uris.map { uri ->
+            ApkSource(displayName(uri) ?: "app.apk") { contentResolver.openInputStream(uri) ?: throw IOException("Could not open the file") }
+        }
+        val bad = sources.firstOrNull { !it.name.endsWith(".apk", true) && !isArchive(it.name) }
+        if (bad != null) { toast("Unsupported file: ${bad.name} (need .apk, .apks, .apkm or .xapk)", error = true); return }
+        sideload(sources, sources.first().name)
+    }
+
+    private fun pickInstalledApp() {
+        toast("Loading apps...")
+        thread(name = "list-installed-apps") {
+            val pm = packageManager
+            val apps = pm.getInstalledApplications(0)
+                .filter { (it.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) == 0 || (it.flags and android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0 }
+                .filter { it.packageName != packageName }
+                .map { Triple(it.loadLabel(pm).toString(), it, runCatching { it.loadIcon(pm) }.getOrNull()) }
+                .sortedBy { it.first.lowercase() }
+            runOnUiThread { if (!isFinishing && !isDestroyed) showInstalledAppsDialog(apps) }
+        }
+    }
+
+    private fun showInstalledAppsDialog(apps: List<Triple<String, android.content.pm.ApplicationInfo, android.graphics.drawable.Drawable?>>) {
+        dismissToast()
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(8), dp(16), dp(8)) }
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        var dialog: AlertDialog? = null
+        fun fill(filter: String) {
+            list.removeAllViews()
+            apps.filter { filter.isBlank() || it.first.contains(filter, true) || it.second.packageName.contains(filter, true) }.forEach { (label, info, icon) ->
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dp(4), dp(8), dp(4), dp(8)); isClickable = true; isFocusable = true
+                    background = ui.pillBg(R.color.md_surface_container_highest, 16)
+                    addView(ImageView(context).apply { setImageDrawable(icon) }, LinearLayout.LayoutParams(dp(36), dp(36)).apply { marginEnd = dp(12); marginStart = dp(8) })
+                    addView(LinearLayout(context).apply {
+                        orientation = LinearLayout.VERTICAL
+                        addView(ui.label(label, 15f, R.color.md_on_surface, bold = true))
+                        addView(ui.label(info.packageName, 12f, R.color.md_on_surface_variant))
+                    }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                    setOnClickListener {
+                        dialog?.dismiss()
+                        val files = listOf(info.sourceDir) + (info.splitSourceDirs?.toList() ?: emptyList())
+                        val names = files.mapIndexed { i, f -> if (i == 0) "base.apk" else File(f).name }
+                        sideload(files.mapIndexed { i, f -> ApkSource(names[i]) { FileInputStream(f) } }, label)
+                    }
+                }
+                list.addView(row, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(4) })
+            }
+        }
+        val search = EditText(this).apply {
+            hint = "Filter apps"; setSingleLine(); textSize = 15f
+            setTextColor(color(R.color.md_on_surface)); setHintTextColor(color(R.color.md_on_surface_variant))
+            background = ui.pillBg(R.color.md_surface_container_highest, 24); setPadding(dp(18), dp(10), dp(18), dp(10))
+            addTextChangedListener(SimpleTextWatcher { fill(it) })
+        }
+        root.addView(search, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
+        root.addView(ScrollView(this).apply { addView(list) }, LinearLayout.LayoutParams(-1, dp(380)))
+        fill("")
+        dialog = AlertDialog.Builder(this).setTitle("Install on the connected device").setView(root)
+            .setNegativeButton("Cancel", null).show()
+    }
+
+    /** Pushes the APK(s) to /data/local/tmp on the target, runs pm install / install-multiple, cleans up. */
+    private fun sideload(sources: List<ApkSource>, label: String) {
+        val connection = adb
+        if (connection == null) { toast("Failed: connect to a device first", error = true); return }
+        if (!sideloading.compareAndSet(false, true)) { toast("Another install is already running", error = true); return }
+        toast("Installing $label...", durationMs = 10 * 60_000L)
+        thread(name = "adb-sideload") {
+            val dir = "/data/local/tmp/adb_sideload_${System.currentTimeMillis()}"
+            var message = ""
+            var error = true
+            try {
+                val mk = execCommand(connection, "mkdir -p $dir")
+                if (!mk.ok) throw IOException("could not create temp dir (${mk.reason})")
+                val abis = execCommand(connection, "getprop ro.product.cpu.abilist", 15_000).output
+                    .trim().split(',').map { it.trim().replace('-', '_') }.filter { it.isNotBlank() }
+                val remotes = mutableListOf<String>()
+                var n = 0
+                for (src in sources) {
+                    if (isArchive(src.name)) {
+                        // .apks / .apkm / .xapk are zips of split APKs: push every APK inside (OBB/other files ignored).
+                        val names = java.util.zip.ZipInputStream(src.open()).use { z ->
+                            generateSequence { z.nextEntry }.map { it.name }.filter { it.endsWith(".apk", true) }.toList()
+                        }
+                        val useSplits = names.any { it.startsWith("splits/") } // bundletool .apks also has standalones/
+                        val wanted = names.filter { (!useSplits || it.startsWith("splits/")) && abiAllowed(it, abis) }.toSet()
+                        if (wanted.isEmpty()) throw IOException("no APK found inside ${src.name}")
+                        java.util.zip.ZipInputStream(src.open()).use { z ->
+                            var e = z.nextEntry
+                            while (e != null) {
+                                if (e.name in wanted) {
+                                    val remote = "$dir/${n++}.apk"
+                                    AdbSyncClient(connection).push(z, remote)
+                                    remotes += remote
+                                }
+                                e = z.nextEntry
+                            }
+                        }
+                    } else {
+                        val remote = "$dir/${n++}.apk"
+                        src.open().use { AdbSyncClient(connection).push(it, remote) }
+                        remotes += remote
+                    }
+                }
+                val args = remotes.joinToString(" ") { shellQuote(it) }
+                val cmd = if (remotes.size == 1) "pm install -r -t $args" else "pm install-multiple -r -t $args"
+                val r = execCommand(connection, cmd, timeoutMs = 180_000)
+                if (r.ok && r.output.contains("Success", ignoreCase = true)) { message = "Installed $label"; error = false }
+                else {
+                    val line = r.output.lineSequence().map { it.trim() }.lastOrNull { it.isNotBlank() }?.take(100)
+                    message = "Install failed" + (line?.let { ": $it" } ?: if (r.reason.isNotBlank()) " (${r.reason})" else "")
+                }
+            } catch (e: Exception) {
+                message = "Install failed: ${e.message ?: e.javaClass.simpleName}"
+            } finally {
+                runCatching { execCommand(connection, "rm -rf $dir", 20_000) }
+                sideloading.set(false)
+            }
+            runOnUiThread { if (!isFinishing && !isDestroyed) toast(message, error = error) }
         }
     }
 
@@ -1118,7 +1346,7 @@ class MainActivity : AppCompatActivity() {
 
     /** In-app toast pinned to the top of this Activity's own view tree (not android.widget.Toast),
      *  so it disappears with the app: removed on pause/stop/destroy instead of lingering. */
-    private fun toast(value: String, error: Boolean = false) {
+    private fun toast(value: String, error: Boolean = false, durationMs: Long = 0L) {
         if (!::rootFrame.isInitialized) return
         dismissToast()
         val view = TextView(this).apply {
@@ -1141,7 +1369,7 @@ class MainActivity : AppCompatActivity() {
         })
         view.animate().alpha(1f).translationY(0f).setDuration(180).start()
         toastView = view
-        handler.postDelayed(toastHide, if (error) 3500 else 2500)
+        handler.postDelayed(toastHide, if (durationMs > 0) durationMs else if (error) 3500 else 2500)
     }
 
     private fun dismissToast() {
@@ -1244,7 +1472,9 @@ class MainActivity : AppCompatActivity() {
         private const val TAB_SCREEN = 4
         private const val TAB_FILES = 5
 
+        private const val PREF_LAST_HOST = "last_host_5555"
         private const val RC_MARK = "__ADB_RC__"
+        private const val REQUEST_SIDELOAD = 2004
         private const val REQUEST_PUSH_FILE = 2001
         private const val REQUEST_PULL_FILE = 2002
         private const val REQUEST_SAVE_SCREEN = 2003

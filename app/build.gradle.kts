@@ -26,12 +26,24 @@ android {
         versionCode = 1
         versionName = "1.0.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        externalNativeBuild {
+            cmake { arguments += listOf("-DANDROID_STL=c++_static") }
+        }
+    }
+
+    // Native SPAKE2 for wireless-debugging pairing (BoringSSL via prefab).
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/jni/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     buildFeatures {
         // Toàn bộ UI giờ dựng bằng code (xem MainActivity.kt) — không còn layout XML nào
         // để ViewBinding sinh class, nên tắt đi cho gọn.
         buildConfig = true
+        prefab = true
     }
 
     compileOptions {
@@ -92,7 +104,19 @@ android {
     }
 
     packaging {
-        resources.excludes += setOf("/META-INF/{AL2.0,LGPL2.1}")
+        resources.excludes += setOf(
+            "/META-INF/{AL2.0,LGPL2.1}",
+            // BouncyCastle + Conscrypt ship multi-release/OSGi metadata that collides on merge
+            // (e.g. META-INF/versions/9/OSGI-INF/MANIFEST.MF); none of it is used on Android.
+            "/META-INF/versions/**",
+            "/META-INF/MANIFEST.MF",
+            "/META-INF/INDEX.LIST",
+            "/META-INF/DEPENDENCIES",
+            "/META-INF/LICENSE*",
+            "/META-INF/NOTICE*",
+            "/META-INF/*.version",
+            "/META-INF/*.kotlin_module"
+        )
     }
 }
 
@@ -103,6 +127,11 @@ dependencies {
     implementation(libs.constraintlayout)
     implementation(libs.recyclerview)
     implementation(libs.lifecycle.runtime.ktx)
+
+    // Wireless-debugging pairing + TLS connect (same stack Shizuku uses).
+    implementation("io.github.vvb2060.ndk:boringssl:20250114")
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.80")
+    implementation("org.conscrypt:conscrypt-android:2.5.2")
 
     testImplementation(libs.junit)
 }
