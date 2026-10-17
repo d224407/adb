@@ -1,4 +1,4 @@
-package com.example.tvremote.adb
+package com.min.adb.adb
 
 import java.io.ByteArrayOutputStream
 import java.io.IOException

@@ -1,4 +1,4 @@
-package com.example.tvremote.adb.transport
+package com.min.adb.adb.transport
 
 /** A raw byte pipe to adbd — either a TCP socket (network ADB) or a USB bulk endpoint pair. */
 interface Transport {

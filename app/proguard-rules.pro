@@ -3,4 +3,4 @@
 -renamesourcefileattribute SourceFile
 
 # ADB protocol classes dùng reflection ở vài chỗ nhạy cảm với tên trường — giữ nguyên để an toàn.
--keep class com.example.tvremote.adb.** { *; }
+-keep class com.min.adb.adb.** { *; }

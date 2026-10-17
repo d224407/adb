@@ -1,4 +1,4 @@
-package com.example.tvremote.adb.transport
+package com.min.adb.adb.transport
 
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice

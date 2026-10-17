@@ -1,4 +1,4 @@
-package com.example.tvremote.adb
+package com.min.adb.adb
 
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -64,5 +64,5 @@ object AdbProtocol {
     fun generateMessage(command: Int, arg0: Int, arg1: Int, payload: ByteArray = ByteArray(0)) =
         Message(command, arg0, arg1, payload).encode()
 
-    fun cnxnPayload(): ByteArray = "host::tvremote\u0000".toByteArray(Charsets.UTF_8)
+    fun cnxnPayload(): ByteArray = "host::adb\u0000".toByteArray(Charsets.UTF_8)
 }

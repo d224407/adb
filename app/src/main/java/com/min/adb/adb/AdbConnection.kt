@@ -1,6 +1,6 @@
-package com.example.tvremote.adb
+package com.min.adb.adb
 
-import com.example.tvremote.adb.transport.Transport
+import com.min.adb.adb.transport.Transport
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
@@ -46,7 +46,7 @@ class AdbConnection(private val transport: Transport, private val crypto: AdbCry
                         } else {
                             // Device didn't accept the signature; fall back to sending our
                             // public key so the user can tap "Allow" on the TV/device.
-                            val pubkey = crypto.publicKeyAdbFormat("tvremote")
+                            val pubkey = crypto.publicKeyAdbFormat("adb")
                             transport.write(AdbProtocol.generateMessage(AdbProtocol.A_AUTH, AdbProtocol.AUTH_RSAPUBLICKEY, 0, pubkey))
                         }
                     }
@@ -69,6 +69,11 @@ class AdbConnection(private val transport: Transport, private val crypto: AdbCry
             }
         } catch (e: IOException) {
             connected = false
+        } finally {
+            // Link is gone: unblock anyone waiting on a stream instead of making them time out.
+            connected = false
+            streams.values.forEach { it.onClose() }
+            streams.clear()
         }
     }
 
