@@ -22,6 +22,10 @@ class AdbConnection(private val transport: Transport, private val crypto: AdbCry
     @Volatile private var connected = false
     private var readThread: Thread? = null
 
+    /** Called (on the read thread) when the link drops on its own; not called after close(). */
+    @Volatile var onClosed: (() -> Unit)? = null
+    @Volatile private var closedByUs = false
+
     fun connect() {
         transport.connect()
         transport.write(AdbProtocol.generateMessage(
@@ -79,6 +83,7 @@ class AdbConnection(private val transport: Transport, private val crypto: AdbCry
             connected = false
             streams.values.forEach { it.onClose() }
             streams.clear()
+            if (!closedByUs) onClosed?.invoke()
         }
     }
 
@@ -127,6 +132,7 @@ class AdbConnection(private val transport: Transport, private val crypto: AdbCry
     }
 
     fun close() {
+        closedByUs = true
         connected = false
         readThread?.interrupt()
         transport.close()

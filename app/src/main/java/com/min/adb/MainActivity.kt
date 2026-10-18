@@ -95,9 +95,37 @@ class MainActivity : AppCompatActivity() {
         crypto = AdbCrypto.loadOrGenerate(this)
         buildShellUi()
         renderTab(TAB_PACKAGES)
-        // Re-connect to the last device on first launch (only ever saved for port 5555).
+        // On launch: look for devices on port 5555 and reconnect if the previous one is among them.
+        autoReconnect = true
+        scanForLastDevice()
+    }
+
+    // ---- Auto-reconnect: scan the LAN for :5555 and connect when the last-used IP shows up ----
+    private var autoReconnect = false
+    private val scanning = AtomicBoolean(false)
+    private val rescan = Runnable { scanForLastDevice() }
+
+    private fun scanForLastDevice() {
+        handler.removeCallbacks(rescan)
         val last = prefs.getString(PREF_LAST_HOST, null)
-        if (!last.isNullOrBlank()) { remoteIp = last; connectNetwork(last, 5555) }
+        if (!autoReconnect || last.isNullOrBlank() || adb != null || isFinishing || isDestroyed) return
+        if (!scanning.compareAndSet(false, true)) return
+        setStatus("Looking for $last...")
+        var matched = false
+        scanForAdbDevices(
+            onFound = { ip ->
+                if (ip == last && adb == null && !matched) {
+                    matched = true
+                    remoteIp = ip; remotePort = 5555
+                    connectNetwork(ip, 5555)
+                }
+            },
+            onDone = {
+                scanning.set(false)
+                // Not on the network yet (or just rebooting): keep looking until it is back.
+                if (!matched && adb == null && autoReconnect && !isFinishing) handler.postDelayed(rescan, 4000)
+            }
+        )
     }
 
     private val prefs by lazy { getSharedPreferences("adb_prefs", MODE_PRIVATE) }
@@ -209,12 +237,22 @@ class MainActivity : AppCompatActivity() {
         ipChip.text = if (adb != null) "$remoteIp:$remotePort" else ""
     }
 
-    private fun renderTab(index: Int) {
-        val previous = selectedTab
-        selectedTab = index
-        updateTabHighlight()
-        filePathEdit = null; fileListContainer = null; fileOutput = null; packageFilter = null; processFilter = null; screenImage = null
-        content.removeAllViews()
+    private class PageRefs(
+        val filePathEdit: EditText?, val fileListContainer: LinearLayout?, val fileOutput: TextView?,
+        val packageFilter: EditText?, val processFilter: EditText?, val screenImage: ImageView?
+    )
+    private fun saveRefs() = PageRefs(filePathEdit, fileListContainer, fileOutput, packageFilter, processFilter, screenImage)
+    private fun restoreRefs(r: PageRefs) {
+        filePathEdit = r.filePathEdit; fileListContainer = r.fileListContainer; fileOutput = r.fileOutput
+        packageFilter = r.packageFilter; processFilter = r.processFilter; screenImage = r.screenImage
+    }
+    private fun clearRefs() { filePathEdit = null; fileListContainer = null; fileOutput = null; packageFilter = null; processFilter = null; screenImage = null }
+
+    private var currentPage: ScrollView? = null
+    private val slideInterpolator = PathInterpolator(0.3f, 0f, 0.2f, 1f)
+
+    /** Builds one tab's page. Leaves that page's view refs in the member fields. */
+    private fun buildPage(index: Int): ScrollView {
         val scroll = ScrollView(this)
         val body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -222,7 +260,6 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(16), dp(14), dp(16), dp(170))
         }
         scroll.addView(body)
-        content.addView(scroll)
         when (index) {
             TAB_PACKAGES -> buildPackagesTab(body)
             TAB_PROCESSES -> buildProcessesTab(body)
@@ -231,38 +268,169 @@ class MainActivity : AppCompatActivity() {
             TAB_SCREEN -> buildScreenTab(body)
             TAB_FILES -> buildFilesTab(body)
         }
-        // Horizontal slide: the new tab enters from the side it sits on (right if it is further along).
-        if (index != previous) {
-            val dir = if (index > previous) 1 else -1
-            scroll.translationX = dir * resources.displayMetrics.widthPixels * 0.35f
-            scroll.alpha = 0f
-            scroll.animate().translationX(0f).alpha(1f).setDuration(240)
-                .setInterpolator(PathInterpolator(0.2f, 0f, 0f, 1f)).start()
+        return scroll
+    }
+
+    /** Drops every page except the current one and stops any running slide. */
+    private fun settlePages() {
+        for (i in content.childCount - 1 downTo 0) {
+            val v = content.getChildAt(i)
+            v.animate().cancel()
+            if (v !== currentPage) content.removeViewAt(i)
+        }
+    }
+
+    private fun renderTab(index: Int) {
+        cancelDrag()
+        settlePages()
+        val previous = selectedTab
+        val old = currentPage
+        selectedTab = index
+        updateTabHighlight()
+        clearRefs()
+        val page = buildPage(index)
+        content.addView(page)
+        currentPage = page
+        if (old != null) {
+            val w = content.width.toFloat()
+            if (index != previous && w > 0f) {
+                // Slides through the tabs in between: distance = number of tabs crossed, so the
+                // duration grows with it (same speed whether you hop one tab or four).
+                val dir = if (index > previous) 1 else -1
+                val dist = Math.abs(index - previous)
+                val duration = (200L * dist).coerceIn(200L, 800L)
+                page.translationX = dir * w * dist
+                old.animate().translationX(-dir * w * dist).setDuration(duration).setInterpolator(slideInterpolator)
+                    .withEndAction { content.removeView(old) }.start()
+                page.animate().translationX(0f).setDuration(duration).setInterpolator(slideInterpolator).start()
+            } else content.removeView(old)
         }
         if (index == TAB_SCREEN && screenAuto) handler.post { scheduleScreenCapture() }
     }
 
-    // Swipe left/right anywhere on the page (not on the nav bar) to move to the next/previous tab.
-    private val swipeDetector by lazy {
-        android.view.GestureDetector(this, object : android.view.GestureDetector.SimpleOnGestureListener() {
-            override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
-                if (e1 == null) return false
-                val dx = e2.x - e1.x
-                val dy = e2.y - e1.y
-                if (Math.abs(dx) < dp(80) || Math.abs(dx) < Math.abs(dy) * 1.8f || Math.abs(vx) < dp(400)) return false
-                val loc = IntArray(2)
-                navScroll.getLocationOnScreen(loc)
-                if (e1.rawY >= loc[1]) return false // started on the nav bar
-                val target = if (dx < 0) selectedTab + 1 else selectedTab - 1
-                if (target in tabNames.indices) renderTab(target)
-                return true
-            }
-        })
+    // ---- Finger-following swipe between neighbouring tabs ----
+    private var dragTracking = false
+    private var dragging = false
+    private var dragStartX = 0f
+    private var dragStartY = 0f
+    private var dragDir = 0 // +1: heading to the next tab (page moves left), -1: previous
+    private var dragNeighbor: ScrollView? = null
+    private var dragNeighborRefs: PageRefs? = null
+    private var dragCurrentRefs: PageRefs? = null
+    private var velocity: android.view.VelocityTracker? = null
+
+    private fun cancelDrag() {
+        if (!dragging && !dragTracking) return
+        dragNeighbor?.let { content.removeView(it) }
+        currentPage?.translationX = 0f
+        dragCurrentRefs?.let { restoreRefs(it) }
+        dragNeighbor = null; dragNeighborRefs = null; dragCurrentRefs = null
+        dragging = false; dragTracking = false
+        velocity?.recycle(); velocity = null
     }
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-        if (::navScroll.isInitialized) swipeDetector.onTouchEvent(ev)
+        if (!::navScroll.isInitialized || !::content.isInitialized) return super.dispatchTouchEvent(ev)
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                val loc = IntArray(2)
+                content.getLocationOnScreen(loc)
+                val inContent = ev.rawY >= loc[1] && ev.rawY < loc[1] + content.height
+                val nav = IntArray(2); navScroll.getLocationOnScreen(nav)
+                dragTracking = inContent && ev.rawY < nav[1] && content.width > 0
+                dragging = false
+                dragStartX = ev.rawX; dragStartY = ev.rawY
+                velocity?.recycle(); velocity = android.view.VelocityTracker.obtain()
+                velocity?.addMovement(ev)
+            }
+            MotionEvent.ACTION_MOVE -> if (dragTracking) {
+                velocity?.addMovement(ev)
+                val dx = ev.rawX - dragStartX
+                val dy = ev.rawY - dragStartY
+                if (!dragging) {
+                    val slop = android.view.ViewConfiguration.get(this).scaledTouchSlop * 2
+                    if (Math.abs(dx) > slop && Math.abs(dx) > Math.abs(dy) * 1.5f) {
+                        beginDrag(if (dx < 0) 1 else -1)
+                        // Stop the child (scroll / click) that was handling this touch.
+                        val cancel = MotionEvent.obtain(ev); cancel.action = MotionEvent.ACTION_CANCEL
+                        super.dispatchTouchEvent(cancel); cancel.recycle()
+                    }
+                }
+                if (dragging) { updateDrag(dx); return true }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                velocity?.addMovement(ev)
+                if (dragging) {
+                    velocity?.computeCurrentVelocity(1000)
+                    endDrag(ev.rawX - dragStartX, velocity?.xVelocity ?: 0f)
+                    velocity?.recycle(); velocity = null
+                    return true
+                }
+                dragTracking = false
+                velocity?.recycle(); velocity = null
+            }
+        }
         return super.dispatchTouchEvent(ev)
+    }
+
+    private fun beginDrag(dir: Int) {
+        settlePages()
+        dragDir = dir
+        dragging = true
+        val target = selectedTab + dir
+        dragCurrentRefs = saveRefs()
+        if (target in tabNames.indices) {
+            clearRefs()
+            val neighbor = buildPage(target)
+            dragNeighborRefs = saveRefs()
+            restoreRefs(dragCurrentRefs!!)
+            neighbor.translationX = dir * content.width.toFloat()
+            content.addView(neighbor)
+            dragNeighbor = neighbor
+        }
+    }
+
+    private fun updateDrag(dx: Float) {
+        val w = content.width.toFloat()
+        val page = currentPage ?: return
+        val raw = if (dragDir > 0) dx.coerceIn(-w, 0f) else dx.coerceIn(0f, w)
+        if (dragNeighbor == null) { page.translationX = raw * 0.25f; return } // edge: rubber band
+        page.translationX = raw
+        dragNeighbor!!.translationX = raw + dragDir * w
+    }
+
+    private fun endDrag(dx: Float, vx: Float) {
+        val w = content.width.toFloat()
+        val page = currentPage
+        val neighbor = dragNeighbor
+        val offset = if (dragDir > 0) dx.coerceIn(-w, 0f) else dx.coerceIn(0f, w)
+        val flung = Math.abs(vx) > dp(600) && (vx < 0) == (dragDir > 0)
+        val commit = neighbor != null && (Math.abs(offset) > w / 3f || flung)
+        val target = selectedTab + dragDir
+        val savedCurrent = dragCurrentRefs
+        val savedNeighbor = dragNeighborRefs
+        dragging = false; dragTracking = false
+        dragNeighbor = null; dragNeighborRefs = null; dragCurrentRefs = null
+        if (page == null) return
+        if (commit && neighbor != null) {
+            // Travel only the distance that is left, so the speed follows the finger's progress.
+            val remaining = 1f - Math.abs(offset) / w
+            val duration = (220f * remaining).toLong().coerceAtLeast(60L)
+            page.animate().translationX(-dragDir * w).setDuration(duration).setInterpolator(slideInterpolator)
+                .withEndAction { content.removeView(page) }.start()
+            neighbor.animate().translationX(0f).setDuration(duration).setInterpolator(slideInterpolator).start()
+            currentPage = neighbor
+            selectedTab = target
+            savedNeighbor?.let { restoreRefs(it) }
+            updateTabHighlight()
+            if (target == TAB_SCREEN && screenAuto) handler.post { scheduleScreenCapture() }
+        } else {
+            val duration = (220f * Math.abs(offset) / w).toLong().coerceAtLeast(60L)
+            page.animate().translationX(0f).setDuration(duration).setInterpolator(slideInterpolator).start()
+            neighbor?.animate()?.translationX(dragDir * w)?.setDuration(duration)?.setInterpolator(slideInterpolator)
+                ?.withEndAction { content.removeView(neighbor) }?.start()
+            savedCurrent?.let { restoreRefs(it) }
+        }
     }
 
     private fun updateTabHighlight() {
@@ -297,7 +465,12 @@ class MainActivity : AppCompatActivity() {
         if (adb != null) {
             container.addView(ui.label("Connected to $remoteIp:$remotePort", 14f, R.color.md_on_surface, bold = true), matchWrap())
             container.addView(ui.pill("Disconnect") {
-                thread { runCatching { adb?.close() }; adb = null; runOnUiThread { updateConnectionChip(); setStatus("Disconnected") } }
+                autoReconnect = false
+                handler.removeCallbacks(rescan)
+                val old = adb
+                old?.onClosed = null
+                adb = null
+                thread { runCatching { old?.close() }; runOnUiThread { updateConnectionChip(); setStatus("Disconnected") } }
             }, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8); bottomMargin = dp(8) })
             divider(container)
         }
@@ -376,12 +549,12 @@ class MainActivity : AppCompatActivity() {
             if (prefix == null) { runOnUiThread { onDone(0) }; return@thread }
             val pool = Executors.newFixedThreadPool(32)
             val latch = CountDownLatch(254)
-            var found = 0
+            val found = java.util.concurrent.atomic.AtomicInteger()
             for (i in 1..254) {
                 pool.execute {
                     try {
                         Socket().use { s -> s.connect(InetSocketAddress("$prefix$i", 5555), 250) }
-                        found++
+                        found.incrementAndGet()
                         runOnUiThread { onFound("$prefix$i") }
                     } catch (_: Exception) {
                         // host down or port closed - expected for most of the subnet
@@ -390,7 +563,7 @@ class MainActivity : AppCompatActivity() {
             }
             latch.await(6, TimeUnit.SECONDS)
             pool.shutdownNow()
-            runOnUiThread { onDone(found) }
+            runOnUiThread { onDone(found.get()) }
         }
     }
 
@@ -459,6 +632,22 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** Makes [connection] the active one and starts watching for it dropping. */
+    private fun attachConnection(connection: AdbConnection) {
+        adb?.let { it.onClosed = null; it.close() }
+        adb = connection
+        autoReconnect = true
+        connection.onClosed = {
+            runOnUiThread {
+                if (adb === connection) {
+                    adb = null
+                    updateConnectionChip(); setStatus("Disconnected")
+                    scanForLastDevice()
+                }
+            }
+        }
+    }
+
     private fun connectNetwork(host: String, port: Int) {
         if (host.isBlank()) { toast("Enter the TV's IP address"); return }
         setStatus("Connecting to $host:$port...")
@@ -466,7 +655,7 @@ class MainActivity : AppCompatActivity() {
             try {
                 val connection = AdbConnection(TcpTransport(host, port), crypto)
                 connection.connect()
-                adb?.close(); adb = connection
+                attachConnection(connection)
                 resetIconPrefetchState()
                 if (port == 5555) prefs.edit().putString(PREF_LAST_HOST, host).apply()
                 runOnUiThread {
@@ -476,7 +665,11 @@ class MainActivity : AppCompatActivity() {
                 }
                 prefetchIconsAfterConnect()
             } catch (e: Exception) {
-                runOnUiThread { setStatus("Connection failed: ${e.message ?: e.javaClass.simpleName}") }
+                runOnUiThread {
+                    setStatus("Connection failed: ${e.message ?: e.javaClass.simpleName}")
+                    // Auto-reconnect target not accepting yet (booting / waiting for Allow): keep trying.
+                    if (autoReconnect && adb == null && host == prefs.getString(PREF_LAST_HOST, null)) handler.postDelayed(rescan, 4000)
+                }
             }
         }
     }
@@ -495,7 +688,7 @@ class MainActivity : AppCompatActivity() {
         thread(name = "adb-connect-usb") {
             try {
                 val connection = AdbConnection(UsbTransport(manager, device), crypto)
-                connection.connect(); adb?.close(); adb = connection
+                connection.connect(); attachConnection(connection)
                 resetIconPrefetchState()
                 runOnUiThread {
                     updateConnectionChip(); setStatus("Connected over USB; fetching app icons...")
@@ -584,26 +777,27 @@ class MainActivity : AppCompatActivity() {
     private fun buildPackagesTab(root: LinearLayout) {
         title(root, "Packages")
         val stateRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        listOf("All" to 0, "Enabled" to 1, "Disabled" to 2).forEach { (label, value) ->
+        listOf(Triple("All", R.drawable.ic_packages, 0), Triple("Enabled", R.drawable.ic_enabled, 1), Triple("Disabled", R.drawable.ic_disabled, 2)).forEach { (label, icon, value) ->
             stateRow.addView(
-                ui.pill(label, primary = packageStateFilter == value) { packageStateFilter = value; renderTab(TAB_PACKAGES) }.withPressAnimation(),
+                ui.iconPill(icon, label, primary = packageStateFilter == value) { packageStateFilter = value; renderTab(TAB_PACKAGES) }.withPressAnimation(),
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(6) }
             )
         }
         root.addView(stateRow, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
-        row(root, listOf(
-            (if (packageShowSystem) "User apps only" else "Include system apps") to { packageShowSystem = !packageShowSystem; renderTab(TAB_PACKAGES) },
-            "Refresh" to { refreshPackages(root) }
-        ))
-        packageFilter = edit(root, "Filter by package name", "", InputType.TYPE_CLASS_TEXT)
+        root.addView(ui.actionRow(
+            ui.iconPill(R.drawable.ic_system, if (packageShowSystem) "Hide system apps" else "Show system apps", primary = packageShowSystem) { packageShowSystem = !packageShowSystem; renderTab(TAB_PACKAGES) }.withPressAnimation(),
+            ui.iconPill(R.drawable.ic_refresh, "Refresh") { refreshPackages(root) }.withPressAnimation()
+        ).apply { setPadding(0, dp(4), 0, 0) }, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
+        val pf = edit(root, "Filter by package name", "", InputType.TYPE_CLASS_TEXT)
+        packageFilter = pf
         val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(list, matchWrap())
         val result = outputView(root, "Waiting for the package list...")
-        packageFilter?.addTextChangedListener(SimpleTextWatcher { filter ->
+        pf.addTextChangedListener(SimpleTextWatcher { filter ->
             list.removeAllViews()
             renderPackageRows(list, filter, result)
         })
-        refreshPackages(root) { list.removeAllViews(); renderPackageRows(list, packageFilter?.text?.toString().orEmpty(), result) }
+        refreshPackages(root) { list.removeAllViews(); renderPackageRows(list, pf.text?.toString().orEmpty(), result) }
     }
 
     /** Fetches user (-3) and, if requested, system (-s) packages as two separate lists so
@@ -678,13 +872,11 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(16), dp(14), dp(16), dp(14))
             addView(header, matchWrap())
         }
-        val actionsTop = ui.actionRow(
-            ui.pill("Launch") { runCommand("monkey -p ${shellQuote(pkg)} -c android.intent.category.LAUNCHER 1") { toast(shortResult(it, "Launched $pkg")) } },
-            ui.pill("Stop") { runCommand("am force-stop ${shellQuote(pkg)}") { toast(shortResult(it, "Stopped $pkg")) } }
-        )
-        val actionsBottom = ui.actionRow(
-            ui.pill("Enable") { runCommand("pm enable ${shellQuote(pkg)}") { toast(shortResult(it, "Enabled $pkg")) } },
-            ui.pill("Disable") {
+        val actions = ui.actionRow(
+            ui.iconPill(R.drawable.ic_launch, "Launch") { runCommand("monkey -p ${shellQuote(pkg)} -c android.intent.category.LAUNCHER 1") { toast(shortResult(it, "Launched $pkg")) } },
+            ui.iconPill(R.drawable.ic_stop, "Force stop") { runCommand("am force-stop ${shellQuote(pkg)}") { toast(shortResult(it, "Stopped $pkg")) } },
+            ui.iconPill(R.drawable.ic_power, "Enable") { runCommand("pm enable ${shellQuote(pkg)}") { toast(shortResult(it, "Enabled $pkg")) } },
+            ui.iconPill(R.drawable.ic_disabled, "Disable") {
                 val disable = { runCommand("pm disable-user --user 0 ${shellQuote(pkg)}") { toast(shortResult(it, "Disabled $pkg")) } }
                 // Only system packages get the warning; user apps are disabled straight away.
                 if (pkg in parsePackageList(packageRawSystem, "")) {
@@ -692,7 +884,7 @@ class MainActivity : AppCompatActivity() {
                         .setNegativeButton("Cancel", null).setPositiveButton("Disable") { _, _ -> disable() }.show()
                 } else disable()
             },
-            ui.pill("Uninstall") {
+            ui.iconPill(R.drawable.ic_delete, "Uninstall") {
                 AlertDialog.Builder(this).setTitle("Uninstall $pkg?").setMessage("Uninstall $pkg for the current user on the target device?")
                     .setNegativeButton("Cancel", null).setPositiveButton("Uninstall") { _, _ ->
                         runCommand("pm uninstall --user 0 ${shellQuote(pkg)}") { toast(shortResult(it, "Uninstalled $pkg")); refreshPackages(listOwner) }
@@ -700,15 +892,9 @@ class MainActivity : AppCompatActivity() {
             }
         )
         // Tools stay collapsed until the card header (icon + name) is tapped.
-        actionsTop.visibility = View.GONE
-        actionsBottom.visibility = View.GONE
-        header.setOnClickListener {
-            val expanded = actionsTop.visibility == View.VISIBLE
-            actionsTop.visibility = if (expanded) View.GONE else View.VISIBLE
-            actionsBottom.visibility = if (expanded) View.GONE else View.VISIBLE
-        }
-        card.addView(actionsTop, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(10) })
-        card.addView(actionsBottom, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
+        actions.visibility = View.GONE
+        header.setOnClickListener { actions.visibility = if (actions.visibility == View.VISIBLE) View.GONE else View.VISIBLE }
+        card.addView(actions, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
         views[pkg] = nameView to icon
         return card
     }
@@ -969,7 +1155,7 @@ class MainActivity : AppCompatActivity() {
             }
             return null
         }
-        return search(content)
+        return currentPage?.let { search(it) }
     }
 
     // ─────────────────────────────────── Screen capture / polling mirror ───────────────────────────────────
@@ -1026,37 +1212,40 @@ class MainActivity : AppCompatActivity() {
     private fun buildFilesTab(root: LinearLayout) {
         title(root, "Files")
         paragraph(root, "Browse and transfer files over ADB SYNC.")
-        val path = edit(root, "Path on the TV", "/sdcard", InputType.TYPE_CLASS_TEXT)
+        val path = edit(root, "Path on the device", "/sdcard", InputType.TYPE_CLASS_TEXT)
         filePathEdit = path
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val output = outputView(root, "Tap List to open a directory")
+        root.removeView(output) // keep original order: buttons, list, output
+        // Page views are captured here (not read from fields later) so a slow reply can't land on another tab.
+        lateinit var reloadFn: (String) -> Unit
+        reloadFn = { p -> listRemoteFiles(p) { entries -> renderFileEntries(entries, list, output, path, reloadFn) } }
+        val reload = reloadFn
         row(root, listOf(
-            "List" to { listRemoteFiles(path.text.toString()) },
-            "Up to parent" to { path.setText(parentPath(path.text.toString())); listRemoteFiles(path.text.toString()) },
-            "New folder" to { askText("New folder name") { name -> runCommand("mkdir -p ${shellQuote(joinRemote(path.text.toString(), name))}") { toast("Folder created"); listRemoteFiles(path.text.toString()) } } }
+            "List" to { reload(path.text.toString()) },
+            "Up to parent" to { path.setText(parentPath(path.text.toString())); reload(path.text.toString()) },
+            "New folder" to { askText("New folder name") { name -> runCommand("mkdir -p ${shellQuote(joinRemote(path.text.toString(), name))}") { toast("Folder created"); reload(path.text.toString()) } } }
         ))
         row(root, listOf(
             "Push file to TV" to { pendingPushPath = path.text.toString().trim().ifBlank { "/sdcard" }; pickLocalFile() },
             "Pull path from TV" to { askText("File path on the TV") { remote -> pendingPullPath = remote; createLocalFile(remote) } }
         ))
-        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(list, matchWrap())
-        val output = outputView(root, "Tap List to open a directory")
+        root.addView(output, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
         fileListContainer = list
         fileOutput = output
-        listRemoteFiles(path.text.toString())
+        reload(path.text.toString())
     }
 
     private fun listRemoteFiles(path: String, done: ((List<String>) -> Unit)? = null) {
         val safe = path.trim().ifBlank { "/sdcard" }
         runShell("ls -1Ap ${shellQuote(safe)}") { raw ->
             val entries = raw.lineSequence().map { it.trimEnd('\r') }.filter { it.isNotBlank() && it != "Permission denied" && !it.startsWith("ls: ") }.toList()
-            if (done != null) done(entries) else renderFileEntries(entries)
+            done?.invoke(entries)
         }
     }
 
-    private fun renderFileEntries(entries: List<String>) {
-        val list = fileListContainer ?: return
-        val output = fileOutput ?: return
-        val path = filePathEdit ?: return
+    private fun renderFileEntries(entries: List<String>, list: LinearLayout, output: TextView, path: EditText, reload: (String) -> Unit) {
         list.removeAllViews()
         output.text = if (entries.isEmpty()) "Empty directory or no read permission." else "${entries.size} items in ${path.text}"
         val rows = entries.map { entry ->
@@ -1064,8 +1253,8 @@ class MainActivity : AppCompatActivity() {
             val name = entry.removeSuffix("/")
             ui.Row(entry, onClick = {
                 val full = joinRemote(path.text.toString(), name)
-                if (isDir) { path.setText(full); listRemoteFiles(full) }
-                else showFileActions(full, output) { listRemoteFiles(path.text.toString()) }
+                if (isDir) { path.setText(full); reload(full) }
+                else showFileActions(full, output) { reload(path.text.toString()) }
             })
         }
         list.addView(ui.group(rows), matchWrap())
@@ -1485,7 +1674,10 @@ class MainActivity : AppCompatActivity() {
         screenAuto = false
         dismissToast()
         handler.removeCallbacksAndMessages(null)
-        thread { runCatching { adb?.close() } }
+        autoReconnect = false
+        val old = adb
+        old?.onClosed = null
+        thread { runCatching { old?.close() } }
     }
 
     companion object {
