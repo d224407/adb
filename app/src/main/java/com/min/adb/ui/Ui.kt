@@ -211,6 +211,25 @@ class Ui(val ctx: Context) {
             setOnClickListener { onClick() }
         }
 
+    /** Icon-only pill button (tooltip + content description carry the name). */
+    fun iconPill(iconRes: Int, description: String, primary: Boolean = false, onClick: () -> Unit): ImageView =
+        ImageView(ctx).apply {
+            setImageResource(iconRes)
+            scaleType = ImageView.ScaleType.CENTER
+            imageTintList = ColorStateList.valueOf(c(if (primary) R.color.md_on_primary else R.color.md_on_secondary_container))
+            contentDescription = description
+            androidx.appcompat.widget.TooltipCompat.setTooltipText(this, description)
+            minimumHeight = dp(48)
+            val r = dp(24).toFloat()
+            background = stateBg(
+                if (primary) R.color.md_primary else R.color.md_secondary_container,
+                floatArrayOf(r, r, r, r, r, r, r, r)
+            )
+            isFocusable = true
+            isClickable = true
+            setOnClickListener { onClick() }
+        }
+
     /** .action-row */
     fun actionRow(vararg buttons: View): LinearLayout = LinearLayout(ctx).apply {
         orientation = LinearLayout.HORIZONTAL
