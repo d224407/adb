@@ -82,6 +82,7 @@ class MainActivity : AppCompatActivity() {
 
     // Tab order: Packages, Processes, Commands, Remote (D-pad), Screen, Files.
     private val tabNames = listOf("Packages", "Processes", "Commands", "Remote", "Screen", "Files")
+    private val tabIcons = listOf(R.drawable.ic_packages, R.drawable.ic_processes, R.drawable.ic_commands, R.drawable.ic_remote, R.drawable.ic_screen, R.drawable.ic_files)
 
     object KeyEvent {
         const val UP = 19; const val DOWN = 20; const val LEFT = 21; const val RIGHT = 22
@@ -123,17 +124,17 @@ class MainActivity : AppCompatActivity() {
             background = ui.pillBg(R.color.md_surface_container_highest, 200)
             setOnClickListener { openConnectDialog() }
         }.withPressAnimation()
-        val connectButton = TextView(this).apply {
-            text = "Connect"
-            textSize = 13.5f
-            typeface = android.graphics.Typeface.create("sans-serif-medium", android.graphics.Typeface.NORMAL)
-            setPadding(dp(16), dp(10), dp(16), dp(10))
-            setTextColor(color(R.color.md_on_primary))
+        val connectButton = ImageView(this).apply {
+            setImageResource(R.drawable.ic_connect)
+            imageTintList = android.content.res.ColorStateList.valueOf(color(R.color.md_on_primary))
+            scaleType = ImageView.ScaleType.CENTER
+            contentDescription = "Connect"
             background = ui.pillBg(R.color.md_primary, 200)
+            isClickable = true; isFocusable = true
             setOnClickListener { openConnectDialog() }
         }.withPressAnimation()
         topBar.addView(ipChip, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(8) })
-        topBar.addView(connectButton, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        topBar.addView(connectButton, LinearLayout.LayoutParams(dp(44), dp(40)))
 
         statusView = TextView(this).apply {
             text = "Not connected"
@@ -161,14 +162,14 @@ class MainActivity : AppCompatActivity() {
         }
         navScroll.addView(tabsRow)
         tabNames.forEachIndexed { index, label ->
-            val item = TextView(this).apply {
-                text = label
-                textSize = 13.5f
-                gravity = Gravity.CENTER
-                setPadding(dp(16), dp(12), dp(16), dp(12))
+            val item = ImageView(this).apply {
+                setImageResource(tabIcons[index])
+                scaleType = ImageView.ScaleType.CENTER
+                contentDescription = label
+                isClickable = true; isFocusable = true
                 setOnClickListener { renderTab(index) }
             }
-            tabsRow.addView(item, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)).apply { marginEnd = dp(2) })
+            tabsRow.addView(item, LinearLayout.LayoutParams(dp(56), dp(44)).apply { if (index < tabNames.size - 1) marginEnd = dp(2) })
         }
         frame.addView(page, FrameLayout.LayoutParams(-1, -1))
         frame.addView(
@@ -209,6 +210,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun renderTab(index: Int) {
+        val previous = selectedTab
         selectedTab = index
         updateTabHighlight()
         filePathEdit = null; fileListContainer = null; fileOutput = null; packageFilter = null; processFilter = null; screenImage = null
@@ -229,22 +231,47 @@ class MainActivity : AppCompatActivity() {
             TAB_SCREEN -> buildScreenTab(body)
             TAB_FILES -> buildFilesTab(body)
         }
-        // Same entrance as @keyframes rise in style.css: translateY(20px)+opacity 0 -> 0/1, .25s.
-        scroll.translationY = dp(20).toFloat()
-        scroll.alpha = 0f
-        scroll.animate().translationY(0f).alpha(1f).setDuration(250)
-            .setInterpolator(PathInterpolator(0.2f, 0f, 0f, 1f)).start()
+        // Horizontal slide: the new tab enters from the side it sits on (right if it is further along).
+        if (index != previous) {
+            val dir = if (index > previous) 1 else -1
+            scroll.translationX = dir * resources.displayMetrics.widthPixels * 0.35f
+            scroll.alpha = 0f
+            scroll.animate().translationX(0f).alpha(1f).setDuration(240)
+                .setInterpolator(PathInterpolator(0.2f, 0f, 0f, 1f)).start()
+        }
         if (index == TAB_SCREEN && screenAuto) handler.post { scheduleScreenCapture() }
+    }
+
+    // Swipe left/right anywhere on the page (not on the nav bar) to move to the next/previous tab.
+    private val swipeDetector by lazy {
+        android.view.GestureDetector(this, object : android.view.GestureDetector.SimpleOnGestureListener() {
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+                if (e1 == null) return false
+                val dx = e2.x - e1.x
+                val dy = e2.y - e1.y
+                if (Math.abs(dx) < dp(80) || Math.abs(dx) < Math.abs(dy) * 1.8f || Math.abs(vx) < dp(400)) return false
+                val loc = IntArray(2)
+                navScroll.getLocationOnScreen(loc)
+                if (e1.rawY >= loc[1]) return false // started on the nav bar
+                val target = if (dx < 0) selectedTab + 1 else selectedTab - 1
+                if (target in tabNames.indices) renderTab(target)
+                return true
+            }
+        })
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (::navScroll.isInitialized) swipeDetector.onTouchEvent(ev)
+        return super.dispatchTouchEvent(ev)
     }
 
     private fun updateTabHighlight() {
         if (!::tabsRow.isInitialized) return
         for (i in 0 until tabsRow.childCount) {
-            val view = tabsRow.getChildAt(i) as TextView
+            val view = tabsRow.getChildAt(i) as ImageView
             val active = i == selectedTab
             view.background = if (active) ui.pillBg(R.color.md_secondary_container, 200) else null
-            view.setTextColor(color(if (active) R.color.md_on_secondary_container else R.color.md_on_surface_variant))
-            view.setTypeface(null, if (active) android.graphics.Typeface.BOLD else android.graphics.Typeface.NORMAL)
+            view.imageTintList = android.content.res.ColorStateList.valueOf(color(if (active) R.color.md_on_secondary_container else R.color.md_on_surface_variant))
         }
         centerSelectedTab()
     }
@@ -482,38 +509,37 @@ class MainActivity : AppCompatActivity() {
     private fun sendKey(code: Int) = runShell("input keyevent $code")
 
     // ─────────────────────────────────── Commands ───────────────────────────────────
-    private data class Builtin(val name: String, val command: String?, val note: String, val confirm: Boolean = false, val action: String? = null)
+    private data class Builtin(val name: String, val command: String?, val action: String? = null)
 
     private fun buildCommandsTab(root: LinearLayout) {
         title(root, "Commands")
-        val packageInput = edit(root, "Package for the force-stop command", "", InputType.TYPE_CLASS_TEXT)
+        val packageInput = edit(root, "Package (for Force-stop)", "", InputType.TYPE_CLASS_TEXT)
         val commands = listOf(
-            Builtin("01 - Location status", "dumpsys location", "Show location services"),
-            Builtin("02 - Disable Developer options flag", "settings put global development_settings_enabled 0", "Changes a system setting", true),
-            Builtin("03 - Open Screen tab", null, "Open the screenshot tab", action = "screen"),
-            Builtin("04 - Reboot", "reboot", "Reboot the device", true),
-            Builtin("05 - Reboot to bootloader", "reboot bootloader", "Only works on supported devices", true),
-            Builtin("06 - Power off", "reboot -p", "Not every device supports this", true),
-            Builtin("07 - Read screen orientation", "settings get system user_rotation", "Read the current rotation value"),
-            Builtin("08 - Force landscape", "settings put system accelerometer_rotation 0; settings put system user_rotation 1", "Disables auto-rotate and sets orientation 1", true),
-            Builtin("09 - Force portrait", "settings put system accelerometer_rotation 0; settings put system user_rotation 0", "Disables auto-rotate and sets orientation 0", true),
-            Builtin("10 - Open Developer options", "am start -a com.android.settings.APPLICATION_DEVELOPMENT_SETTINGS", "The activity name can differ between ROMs"),
-            Builtin("11 - Enable auto-rotate", "settings put system accelerometer_rotation 1", "Turns auto-rotate back on", true),
-            Builtin("12 - Disable auto-rotate", "settings put system accelerometer_rotation 0", "Turns auto-rotate off", true),
-            Builtin("13 - Set debug refresh rate to 90", "setprop debug.oculus.refreshRate 90", "Debug property; does not guarantee a 90 Hz panel", true),
-            Builtin("14 - ADB device info", "getprop ro.serialno; getprop ro.product.model; getprop ro.build.version.release", "Reads serial, model and Android version"),
-            Builtin("15 - Active windows", "dumpsys window windows", "System window information"),
-            Builtin("16 - Force-stop a package", "am force-stop {pkg}", "Enter a package in the field above", true),
-            Builtin("17 - Kill eligible background processes", "am kill-all", "Android may skip some processes", true),
-            Builtin("18 - WLAN IP address", "ip -f inet addr show wlan0", "Wi-Fi network information"),
-            Builtin("19 - WLAN IPv4 address only", "ip -f inet addr show wlan0 | grep 'inet '", "May differ on devices with another interface name"),
-            Builtin("20 - List /system/bin", "ls /system/bin", "List system commands"),
-            Builtin("21 - Status bar transaction 1", "service call statusbar 1", "Binder call; behavior depends on Android version", true),
-            Builtin("22 - Status bar transaction 2", "service call statusbar 2", "Binder call; behavior depends on Android version", true),
-            Builtin("23 - Settings (global)", "settings list global", "List global settings"),
-            Builtin("24 - Settings (secure)", "settings list secure", "List secure settings"),
-            Builtin("25 - Settings (system)", "settings list system", "List system settings"),
-            Builtin("26 - List permissions", "pm list permissions", "List Android permissions")
+            Builtin("Pull down status bar", "cmd statusbar expand-notifications"),
+            Builtin("Pull down quick settings", "cmd statusbar expand-settings"),
+            Builtin("Collapse status bar", "cmd statusbar collapse"),
+            Builtin("Open Screen tab", null, action = "screen"),
+            Builtin("Reboot", "reboot"),
+            Builtin("Reboot to bootloader", "reboot bootloader"),
+            Builtin("Power off", "reboot -p"),
+            Builtin("Open Developer options", "am start -a com.android.settings.APPLICATION_DEVELOPMENT_SETTINGS"),
+            Builtin("Disable Developer options", "settings put global development_settings_enabled 0"),
+            Builtin("Force landscape", "settings put system accelerometer_rotation 0; settings put system user_rotation 1"),
+            Builtin("Force portrait", "settings put system accelerometer_rotation 0; settings put system user_rotation 0"),
+            Builtin("Auto-rotate on", "settings put system accelerometer_rotation 1"),
+            Builtin("Auto-rotate off", "settings put system accelerometer_rotation 0"),
+            Builtin("Screen orientation", "settings get system user_rotation"),
+            Builtin("Force-stop package", "am force-stop {pkg}"),
+            Builtin("Kill background processes", "am kill-all"),
+            Builtin("Device info", "getprop ro.serialno; getprop ro.product.model; getprop ro.build.version.release"),
+            Builtin("Location status", "dumpsys location"),
+            Builtin("Active windows", "dumpsys window windows"),
+            Builtin("WLAN IP address", "ip -f inet addr show wlan0 | grep 'inet '"),
+            Builtin("List /system/bin", "ls /system/bin"),
+            Builtin("Settings (global)", "settings list global"),
+            Builtin("Settings (secure)", "settings list secure"),
+            Builtin("Settings (system)", "settings list system"),
+            Builtin("List permissions", "pm list permissions")
         )
         val rows = commands.map { item ->
             val handler: () -> Unit = handler@{
@@ -521,26 +547,23 @@ class MainActivity : AppCompatActivity() {
                 var command = item.command ?: return@handler
                 if ("{pkg}" in command) {
                     val pkg = packageInput.text.toString().trim()
-                    if (pkg.isBlank() || !pkg.matches(Regex("[A-Za-z0-9_.]+"))) { toast("Enter a valid package name first"); return@handler }
+                    if (pkg.isBlank() || !pkg.matches(Regex("[A-Za-z0-9_.]+"))) { toast("Enter a valid package name first", error = true); return@handler }
                     command = command.replace("{pkg}", shellQuote(pkg))
                 }
                 val cmd = command
-                val execute = { runCommand(cmd) { result -> showOutputDialog(cmd, result) } }
-                if (item.confirm) AlertDialog.Builder(this).setTitle("Confirm command")
-                    .setMessage("${item.note}\n\n$cmd")
-                    .setNegativeButton("Cancel", null).setPositiveButton("Run") { _, _ -> execute() }.show()
-                else execute()
+                // Runs immediately. Commands that print nothing just toast "Done"; failures only toast.
+                runCommand(cmd) { result -> if (result == "(no output)") toast("Done") else showOutputDialog(item.name, result) }
             }
-            ui.Row(item.name, item.note, onClick = handler)
+            ui.Row(item.name, null, onClick = handler)
         }
         root.addView(ui.group(rows), matchWrap())
         divider(root)
         title(root, "Custom command")
         val custom = edit(root, "Enter a shell command", "", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE)
         row(root, listOf(
-            "Run" to { val cmd = custom.text.toString().trim(); if (cmd.isNotEmpty()) runCommand(cmd) { result -> showOutputDialog(cmd, result) } },
-            "Device info" to { runCommand("getprop; echo '=== BATTERY ==='; dumpsys battery; echo '=== RAM ==='; cat /proc/meminfo; echo '=== STORAGE ==='; df -h /data") { result -> showOutputDialog("device info", result) } },
-            "Recent logcat" to { runCommand("logcat -d -t 500") { result -> showOutputDialog("logcat -d -t 500", result) } }
+            "Run" to { val cmd = custom.text.toString().trim(); if (cmd.isNotEmpty()) runCommand(cmd) { result -> if (result == "(no output)") toast("Done") else showOutputDialog(cmd, result) } },
+            "Device info" to { runCommand("getprop; echo '=== BATTERY ==='; dumpsys battery; echo '=== RAM ==='; cat /proc/meminfo; echo '=== STORAGE ==='; df -h /data") { result -> showOutputDialog("Device info", result) } },
+            "Logcat" to { runCommand("logcat -d -t 500") { result -> showOutputDialog("Logcat", result) } }
         ))
     }
 
@@ -662,10 +685,12 @@ class MainActivity : AppCompatActivity() {
         val actionsBottom = ui.actionRow(
             ui.pill("Enable") { runCommand("pm enable ${shellQuote(pkg)}") { toast(shortResult(it, "Enabled $pkg")) } },
             ui.pill("Disable") {
-                AlertDialog.Builder(this).setTitle("Disable $pkg?").setMessage("Disabling a system package can break TV features until re-enabled.")
-                    .setNegativeButton("Cancel", null).setPositiveButton("Disable") { _, _ ->
-                        runCommand("pm disable-user --user 0 ${shellQuote(pkg)}") { toast(shortResult(it, "Disabled $pkg")) }
-                    }.show()
+                val disable = { runCommand("pm disable-user --user 0 ${shellQuote(pkg)}") { toast(shortResult(it, "Disabled $pkg")) } }
+                // Only system packages get the warning; user apps are disabled straight away.
+                if (pkg in parsePackageList(packageRawSystem, "")) {
+                    AlertDialog.Builder(this).setTitle("Disable $pkg?").setMessage("Disabling a system package can break features until re-enabled.")
+                        .setNegativeButton("Cancel", null).setPositiveButton("Disable") { _, _ -> disable() }.show()
+                } else disable()
             },
             ui.pill("Uninstall") {
                 AlertDialog.Builder(this).setTitle("Uninstall $pkg?").setMessage("Uninstall $pkg for the current user on the target device?")
