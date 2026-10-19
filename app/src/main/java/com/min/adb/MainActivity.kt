@@ -81,8 +81,8 @@ class MainActivity : AppCompatActivity() {
     private var pendingPullPath: String? = null
 
     // Tab order: Packages, Processes, Commands, Remote (D-pad), Screen, Files.
-    private val tabNames = listOf("Packages", "Processes", "Commands", "Remote", "Screen", "Files")
-    private val tabIcons = listOf(R.drawable.ic_packages, R.drawable.ic_processes, R.drawable.ic_commands, R.drawable.ic_remote, R.drawable.ic_screen, R.drawable.ic_files)
+    private val tabNames = listOf("Packages", "Terminal", "Commands", "Processes", "Remote", "Screen", "Files")
+    private val tabIcons = listOf(R.drawable.ic_packages, R.drawable.ic_commands, R.drawable.ic_bolt, R.drawable.ic_processes, R.drawable.ic_remote, R.drawable.ic_screen, R.drawable.ic_files)
 
     object KeyEvent {
         const val UP = 19; const val DOWN = 20; const val LEFT = 21; const val RIGHT = 22
@@ -210,6 +210,7 @@ class MainActivity : AppCompatActivity() {
         // Rounded-square "+" (sideload APK), floating just above the bottom pill nav bar.
         val fabRadius = dp(18).toFloat()
         val fab = TextView(this).apply {
+            fabView = this
             text = "+"
             textSize = 30f
             gravity = Gravity.CENTER
@@ -248,11 +249,13 @@ class MainActivity : AppCompatActivity() {
     }
     private fun clearRefs() { filePathEdit = null; fileListContainer = null; fileOutput = null; packageFilter = null; processFilter = null; screenImage = null }
 
-    private var currentPage: ScrollView? = null
+    private var currentPage: View? = null
+    private var fabView: View? = null
     private val slideInterpolator = PathInterpolator(0.3f, 0f, 0.2f, 1f)
 
     /** Builds one tab's page. Leaves that page's view refs in the member fields. */
-    private fun buildPage(index: Int): ScrollView {
+    private fun buildPage(index: Int): View {
+        if (index == TAB_TERMINAL) return buildTerminalPage()
         val scroll = ScrollView(this)
         val body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -314,7 +317,7 @@ class MainActivity : AppCompatActivity() {
     private var dragStartX = 0f
     private var dragStartY = 0f
     private var dragDir = 0 // +1: heading to the next tab (page moves left), -1: previous
-    private var dragNeighbor: ScrollView? = null
+    private var dragNeighbor: View? = null
     private var dragNeighborRefs: PageRefs? = null
     private var dragCurrentRefs: PageRefs? = null
     private var velocity: android.view.VelocityTracker? = null
@@ -381,7 +384,7 @@ class MainActivity : AppCompatActivity() {
         dragCurrentRefs = saveRefs()
         if (target in tabNames.indices) {
             clearRefs()
-            val neighbor = buildPage(target)
+            val neighbor: View = buildPage(target)
             dragNeighborRefs = saveRefs()
             restoreRefs(dragCurrentRefs!!)
             neighbor.translationX = dir * content.width.toFloat()
@@ -440,6 +443,7 @@ class MainActivity : AppCompatActivity() {
             val active = i == selectedTab
             view.background = if (active) ui.pillBg(R.color.md_secondary_container, 200) else null
             view.imageTintList = android.content.res.ColorStateList.valueOf(color(if (active) R.color.md_on_secondary_container else R.color.md_on_surface_variant))
+            fabView?.visibility = if (selectedTab == TAB_TERMINAL) View.GONE else View.VISIBLE
         }
         centerSelectedTab()
     }
@@ -470,6 +474,7 @@ class MainActivity : AppCompatActivity() {
                 val old = adb
                 old?.onClosed = null
                 adb = null
+                closeTerminal()
                 thread { runCatching { old?.close() }; runOnUiThread { updateConnectionChip(); setStatus("Disconnected") } }
             }, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8); bottomMargin = dp(8) })
             divider(container)
@@ -635,12 +640,14 @@ class MainActivity : AppCompatActivity() {
     /** Makes [connection] the active one and starts watching for it dropping. */
     private fun attachConnection(connection: AdbConnection) {
         adb?.let { it.onClosed = null; it.close() }
+        closeTerminal()
         adb = connection
         autoReconnect = true
         connection.onClosed = {
             runOnUiThread {
                 if (adb === connection) {
                     adb = null
+                    closeTerminal()
                     updateConnectionChip(); setStatus("Disconnected")
                     scanForLastDevice()
                 }
@@ -706,7 +713,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun buildCommandsTab(root: LinearLayout) {
         title(root, "Commands")
-        val packageInput = edit(root, "Package (for Force-stop)", "", InputType.TYPE_CLASS_TEXT)
         val commands = listOf(
             Builtin("Pull down status bar", "cmd statusbar expand-notifications"),
             Builtin("Pull down quick settings", "cmd statusbar expand-settings"),
@@ -722,7 +728,6 @@ class MainActivity : AppCompatActivity() {
             Builtin("Auto-rotate on", "settings put system accelerometer_rotation 1"),
             Builtin("Auto-rotate off", "settings put system accelerometer_rotation 0"),
             Builtin("Screen orientation", "settings get system user_rotation"),
-            Builtin("Force-stop package", "am force-stop {pkg}"),
             Builtin("Kill background processes", "am kill-all"),
             Builtin("Device info", "getprop ro.serialno; getprop ro.product.model; getprop ro.build.version.release"),
             Builtin("Location status", "dumpsys location"),
@@ -732,32 +737,20 @@ class MainActivity : AppCompatActivity() {
             Builtin("Settings (global)", "settings list global"),
             Builtin("Settings (secure)", "settings list secure"),
             Builtin("Settings (system)", "settings list system"),
-            Builtin("List permissions", "pm list permissions")
+            Builtin("List permissions", "pm list permissions"),
+            Builtin("Logcat", "logcat -d -t 500"),
+            Builtin("System info", "getprop; echo '=== BATTERY ==='; dumpsys battery; echo '=== RAM ==='; cat /proc/meminfo; echo '=== STORAGE ==='; df -h /data")
         )
         val rows = commands.map { item ->
             val handler: () -> Unit = handler@{
                 if (item.action == "screen") { renderTab(TAB_SCREEN); return@handler }
-                var command = item.command ?: return@handler
-                if ("{pkg}" in command) {
-                    val pkg = packageInput.text.toString().trim()
-                    if (pkg.isBlank() || !pkg.matches(Regex("[A-Za-z0-9_.]+"))) { toast("Enter a valid package name first", error = true); return@handler }
-                    command = command.replace("{pkg}", shellQuote(pkg))
-                }
-                val cmd = command
+                val cmd = item.command ?: return@handler
                 // Runs immediately. Commands that print nothing just toast "Done"; failures only toast.
                 runCommand(cmd) { result -> if (result == "(no output)") toast("Done") else showOutputDialog(item.name, result) }
             }
             ui.Row(item.name, null, onClick = handler)
         }
         root.addView(ui.group(rows), matchWrap())
-        divider(root)
-        title(root, "Custom command")
-        val custom = edit(root, "Enter a shell command", "", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE)
-        row(root, listOf(
-            "Run" to { val cmd = custom.text.toString().trim(); if (cmd.isNotEmpty()) runCommand(cmd) { result -> if (result == "(no output)") toast("Done") else showOutputDialog(cmd, result) } },
-            "Device info" to { runCommand("getprop; echo '=== BATTERY ==='; dumpsys battery; echo '=== RAM ==='; cat /proc/meminfo; echo '=== STORAGE ==='; df -h /data") { result -> showOutputDialog("Device info", result) } },
-            "Logcat" to { runCommand("logcat -d -t 500") { result -> showOutputDialog("Logcat", result) } }
-        ))
     }
 
     /** Commands tab no longer keeps a persistent output panel; every run shows its result here instead. */
@@ -902,7 +895,7 @@ class MainActivity : AppCompatActivity() {
     // ──────────────────────── Fast bulk icon/label fetch via the on-device helper ────────────────────────
     private val HELPER_PKG = "com.min.adb.iconhelper"
     private val HELPER_ACTION = "com.min.adb.iconhelper.DUMP_ICONS"
-    private val HELPER_REMOTE_DIR = "/sdcard/adb_icons"
+    private val HELPER_DATA_DIR = "/sdcard/Android/data/$HELPER_PKG/files"
     private val bulkIconCache = HashMap<String, Pair<String?, Bitmap?>>()
     @Volatile private var iconsPrefetched = false
     @Volatile private var bulkIconError: String? = null
@@ -954,7 +947,7 @@ class MainActivity : AppCompatActivity() {
                 val installedVersion = Regex("versionCode=(\\d+)").find(installedVersionLine)?.groupValues?.get(1)?.toIntOrNull() ?: 0
                 // Version 2 adds QUERY_ALL_PACKAGES. Replace an older helper so an installation
                 // from a previous build cannot silently keep returning a filtered package list.
-                if (installedVersion < 2) {
+                if (installedVersion < 3) {
                     if (installedVersion > 0) connection.shell("pm uninstall $HELPER_PKG")
                     val apk = File(cacheDir, "iconhelper.apk")
                     assets.open("iconhelper.apk").use { input -> apk.outputStream().use { input.copyTo(it) } }
@@ -965,8 +958,10 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 // 2) Clear stale files, explicitly target the receiver, and wait for DONE.
-                connection.shell("rm -rf $HELPER_REMOTE_DIR")
-                val broadcast = connection.shell("am broadcast -n $HELPER_PKG/.DumpReceiver -a $HELPER_ACTION")
+                // Fresh folder name per run, so a leftover DONE from an earlier run can't be mistaken for this one.
+                val runDir = "icons_${System.currentTimeMillis()}"
+                val HELPER_REMOTE_DIR = "$HELPER_DATA_DIR/$runDir"
+                val broadcast = connection.shell("am broadcast -n $HELPER_PKG/.DumpReceiver -a $HELPER_ACTION --es dir $runDir")
                 if (broadcast.contains("Error", ignoreCase = true) || broadcast.contains("not found", ignoreCase = true)) {
                     throw IOException("could not start icon helper: $broadcast")
                 }
@@ -981,7 +976,7 @@ class MainActivity : AppCompatActivity() {
                 if (!completed) throw IOException("icon helper timed out (no DONE file)")
 
                 // 3) Create one archive and pull it to the phone in a single ADB sync transfer.
-                val remoteTar = "$HELPER_REMOTE_DIR.tar"
+                val remoteTar = "/data/local/tmp/adb_icons.tar"
                 val tarResult = connection.shell("tar -cf $remoteTar -C $HELPER_REMOTE_DIR .")
                 val tarCheck = connection.shell("test -s $remoteTar && echo TAR_OK")
                 if (!tarCheck.contains("TAR_OK")) throw IOException("could not create icon archive: $tarResult")
@@ -1123,6 +1118,91 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ─────────────────────────────────── Processes ───────────────────────────────────
+    // ─────────────────────────────────── Terminal ───────────────────────────────────
+    private var terminal: TerminalSession? = null
+    private var terminalFor: AdbConnection? = null
+    private var terminalView: TextView? = null
+    private var terminalScroll: ScrollView? = null
+    private val terminalRefresh = Runnable {
+        val t = terminal ?: return@Runnable
+        val view = terminalView ?: return@Runnable
+        view.text = t.text()
+        terminalScroll?.post { terminalScroll?.fullScroll(View.FOCUS_DOWN) }
+    }
+
+    private fun scheduleTerminalRefresh() {
+        handler.removeCallbacks(terminalRefresh)
+        handler.postDelayed(terminalRefresh, 50)
+    }
+
+    private fun closeTerminal() {
+        terminal?.close(); terminal = null; terminalFor = null
+    }
+
+    /** Opens the shell for the current connection when needed (new connection, or the old one ended). */
+    private fun ensureTerminal(): TerminalSession? {
+        val c = adb ?: return null
+        val existing = terminal
+        if (existing != null && !existing.ended && terminalFor === c) return existing
+        closeTerminal()
+        return try {
+            TerminalSession(c) { runOnUiThread { scheduleTerminalRefresh() } }.also { terminal = it; terminalFor = c }
+        } catch (e: Exception) { toast("Terminal failed: ${e.message ?: e.javaClass.simpleName}", error = true); null }
+    }
+
+    private fun buildTerminalPage(): View {
+        val session = ensureTerminal()
+        val page = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(88)) // clear of the floating nav bar
+        }
+        val output = ui.label(session?.text() ?: "Not connected. Use the connect button at the top.", 12f, R.color.md_on_surface, mono = true).apply {
+            setTextIsSelectable(true)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+        }
+        val scroll = ScrollView(this).apply {
+            background = ui.pillBg(R.color.md_surface_container_high, 16)
+            addView(output)
+        }
+        terminalView = output; terminalScroll = scroll
+        scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+        page.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f).apply { bottomMargin = dp(8) })
+
+        fun key(label: String, bytes: ByteArray) = ui.pill(label) { terminal?.send(bytes) ?: toast("Not connected", error = true) }.apply {
+            minHeight = dp(40); setPadding(dp(8), dp(6), dp(8), dp(6)); textSize = 14f
+        }
+        page.addView(ui.actionRow(
+            key("^C", byteArrayOf(3)), key("Tab", byteArrayOf(9)),
+            key("\u2191", "\u001B[A".toByteArray()), key("\u2193", "\u001B[B".toByteArray()),
+            ui.pill("Clear") { terminal?.clear(); terminal?.send("\n".toByteArray()) }.apply { minHeight = dp(40); setPadding(dp(8), dp(6), dp(8), dp(6)); textSize = 14f }
+        ).apply { setPadding(0, 0, 0, dp(8)) }, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val input = EditText(this).apply {
+            hint = "$"; textSize = 14f; typeface = android.graphics.Typeface.MONOSPACE
+            setSingleLine()
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+            imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_SEND
+            setTextColor(color(R.color.md_on_surface)); setHintTextColor(color(R.color.md_on_surface_variant))
+            background = ui.pillBg(R.color.md_surface_container_highest, 24)
+            setPadding(dp(18), dp(12), dp(18), dp(12))
+        }
+        fun submit() {
+            val t = terminal ?: ensureTerminal()
+            if (t == null) { toast("Not connected", error = true); return }
+            t.sendLine(input.text.toString())
+            input.setText("")
+        }
+        input.setOnEditorActionListener { _, actionId, event ->
+            if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_SEND ||
+                (event != null && event.keyCode == android.view.KeyEvent.KEYCODE_ENTER && event.action == android.view.KeyEvent.ACTION_DOWN)) { submit(); true } else false
+        }
+        val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        bar.addView(input, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(8) })
+        bar.addView(ui.iconPill(R.drawable.ic_send, "Send", primary = true) { submit() }, LinearLayout.LayoutParams(dp(52), dp(48)))
+        page.addView(bar, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT))
+        return page
+    }
+
     private fun buildProcessesTab(root: LinearLayout) {
         title(root, "Processes")
         paragraph(root, "From ps -A. Columns vary by Android version.")
@@ -1675,6 +1755,7 @@ class MainActivity : AppCompatActivity() {
         dismissToast()
         handler.removeCallbacksAndMessages(null)
         autoReconnect = false
+        closeTerminal()
         val old = adb
         old?.onClosed = null
         thread { runCatching { old?.close() } }
@@ -1683,11 +1764,12 @@ class MainActivity : AppCompatActivity() {
     companion object {
         // Tab indices, matching the order in `tabNames` above.
         private const val TAB_PACKAGES = 0
-        private const val TAB_PROCESSES = 1
+        private const val TAB_TERMINAL = 1
         private const val TAB_COMMANDS = 2
-        private const val TAB_REMOTE = 3
-        private const val TAB_SCREEN = 4
-        private const val TAB_FILES = 5
+        private const val TAB_PROCESSES = 3
+        private const val TAB_REMOTE = 4
+        private const val TAB_SCREEN = 5
+        private const val TAB_FILES = 6
 
         private const val PREF_LAST_HOST = "last_host_5555"
         private const val RC_MARK = "__ADB_RC__"

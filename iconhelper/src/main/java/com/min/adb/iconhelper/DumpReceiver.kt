@@ -15,7 +15,7 @@ import java.io.File
  * TV's own PackageManager directly - which is instant, since it never has to touch an APK file.
  *
  * Writes one small PNG per installed app plus a manifest.csv (packageName,label) into
- * /sdcard/adb_icons, then drops a DONE sentinel so the caller on the phone/controller side
+ * Android/data/<this package>/files/<dir>, then drops a DONE sentinel so the caller on the phone/controller side
  * knows when it's safe to tar + pull the whole folder in one shot.
  */
 class DumpReceiver : BroadcastReceiver() {
@@ -25,7 +25,7 @@ class DumpReceiver : BroadcastReceiver() {
         val pending = goAsync()
         Thread {
             try {
-                dumpAll(context)
+                dumpAll(context, intent.getStringExtra("dir")?.takeIf { it.matches(Regex("[A-Za-z0-9_]+")) } ?: "adb_icons")
             } catch (e: Exception) {
                 // Best effort - whatever got written before the failure is still usable.
             } finally {
@@ -34,9 +34,13 @@ class DumpReceiver : BroadcastReceiver() {
         }.start()
     }
 
-    private fun dumpAll(context: Context) {
+    private fun dumpAll(context: Context, dirName: String) {
         val pm = context.packageManager
-        val dir = File("/sdcard/adb_icons")
+        // App-specific external storage (/sdcard/Android/data/<this package>/files): our own data
+        // dir, so no storage permission is needed, and adb's shell user can still read it.
+        val base = context.getExternalFilesDir(null) ?: context.filesDir
+        base.listFiles()?.filter { it.isDirectory && it.name != dirName }?.forEach { it.deleteRecursively() } // stale runs
+        val dir = File(base, dirName)
         dir.deleteRecursively()
         dir.mkdirs()
 
