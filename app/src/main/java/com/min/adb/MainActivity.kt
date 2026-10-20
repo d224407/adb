@@ -668,7 +668,7 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     updateConnectionChip(); setStatus("Connected - $host:$port; fetching app icons...")
                     // Load packages (and icons) right away instead of waiting for a manual Refresh.
-                    if (selectedTab == TAB_PACKAGES) renderTab(TAB_PACKAGES)
+                    if (selectedTab == TAB_PACKAGES || selectedTab == TAB_TERMINAL) renderTab(selectedTab)
                 }
                 prefetchIconsAfterConnect()
             } catch (e: Exception) {
@@ -699,7 +699,7 @@ class MainActivity : AppCompatActivity() {
                 resetIconPrefetchState()
                 runOnUiThread {
                     updateConnectionChip(); setStatus("Connected over USB; fetching app icons...")
-                    if (selectedTab == TAB_PACKAGES) renderTab(TAB_PACKAGES)
+                    if (selectedTab == TAB_PACKAGES || selectedTab == TAB_TERMINAL) renderTab(selectedTab)
                 }
                 prefetchIconsAfterConnect()
             } catch (e: Exception) { runOnUiThread { setStatus("USB connection failed: ${e.message}") } }
@@ -876,6 +876,12 @@ class MainActivity : AppCompatActivity() {
                     AlertDialog.Builder(this).setTitle("Disable $pkg?").setMessage("Disabling a system package can break features until re-enabled.")
                         .setNegativeButton("Cancel", null).setPositiveButton("Disable") { _, _ -> disable() }.show()
                 } else disable()
+            },
+            ui.iconPill(R.drawable.ic_clear_data, "Clear data") {
+                AlertDialog.Builder(this).setTitle("Clear data of $pkg?").setMessage("Deletes all app data (settings, accounts, files) on the target device.")
+                    .setNegativeButton("Cancel", null).setPositiveButton("Clear") { _, _ ->
+                        runCommand("pm clear ${shellQuote(pkg)}") { toast(shortResult(it, "Cleared data of $pkg")) }
+                    }.show()
             },
             ui.iconPill(R.drawable.ic_delete, "Uninstall") {
                 AlertDialog.Builder(this).setTitle("Uninstall $pkg?").setMessage("Uninstall $pkg for the current user on the target device?")
@@ -1156,7 +1162,7 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(10), dp(12), dp(88)) // clear of the floating nav bar
         }
-        val output = ui.label(session?.text() ?: "Not connected. Use the connect button at the top.", 12f, R.color.md_on_surface, mono = true).apply {
+        val output = ui.label(session?.text() ?: if (adb == null) "Not connected. Use the connect button at the top." else "Starting shell...", 12f, R.color.md_on_surface, mono = true).apply {
             setTextIsSelectable(true)
             setPadding(dp(12), dp(10), dp(12), dp(10))
         }

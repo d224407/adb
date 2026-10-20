@@ -13,8 +13,8 @@ import kotlin.concurrent.thread
  * `adb shell`), so cd/env/history persist, output streams live, Ctrl-C works. Output is run through
  * a tiny terminal emulator (ANSI escapes stripped, \r overwrite, backspace, clear screen).
  */
-class TerminalSession(connection: AdbConnection, private val onChange: () -> Unit) {
-    private val stream: AdbStream = connection.open("shell:")
+class TerminalSession(private val connection: AdbConnection, private val onChange: () -> Unit) {
+    @Volatile private var stream: AdbStream? = null
     private val model = StringBuilder()
     private val writer = Executors.newSingleThreadExecutor()
     @Volatile var ended = false
@@ -29,12 +29,15 @@ class TerminalSession(connection: AdbConnection, private val onChange: () -> Uni
     private var pendingCr = false
 
     init {
+        // Everything touching the socket (opening the stream included) stays off the UI thread.
         thread(name = "adb-terminal-read", isDaemon = true) {
             try {
+                val st = connection.open("shell:")
+                stream = st
                 while (!ended) {
-                    val chunk = stream.read(1000)
-                    if (chunk == null) { if (stream.closed) break else continue }
-                    if (chunk.isEmpty()) { if (stream.closed) break else continue }
+                    val chunk = st.read(1000)
+                    if (chunk == null) { if (st.closed) break else continue }
+                    if (chunk.isEmpty()) { if (st.closed) break else continue }
                     feed(decode(chunk))
                     onChange()
                 }
@@ -53,13 +56,20 @@ class TerminalSession(connection: AdbConnection, private val onChange: () -> Uni
 
     fun send(bytes: ByteArray) {
         if (ended) return
-        writer.execute { try { stream.write(bytes) } catch (_: Exception) { } }
+        writer.execute {
+            try {
+                // The reader thread opens the stream; wait briefly for it on first use.
+                var waited = 0
+                while (stream == null && !ended && waited < 5000) { Thread.sleep(20); waited += 20 }
+                stream?.write(bytes)
+            } catch (_: Exception) { }
+        }
     }
 
     fun close() {
         ended = true
         runCatching { writer.shutdownNow() }
-        Thread { runCatching { stream.close() } }.start()
+        Thread { runCatching { stream?.close() } }.start()
     }
 
     private fun decode(chunk: ByteArray): String {
