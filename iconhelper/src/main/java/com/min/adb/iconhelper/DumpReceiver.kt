@@ -10,7 +10,7 @@ import android.graphics.drawable.Drawable
 import java.io.File
 
 /**
- * Runs entirely on the TV. This is the "mồi" app idea: instead of the remote pulling every APK
+ * Runs entirely on the TV. This is the "stub" app idea: instead of the remote pulling every APK
  * over ADB and parsing it just to read one icon, this tiny helper sits on-device and asks the
  * TV's own PackageManager directly - which is instant, since it never has to touch an APK file.
  *

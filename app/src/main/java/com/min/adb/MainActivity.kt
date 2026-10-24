@@ -16,6 +16,8 @@ import android.provider.OpenableColumns
 import android.text.InputType
 import android.view.Gravity
 import android.view.MotionEvent
+import android.view.Surface
+import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
 import android.view.animation.PathInterpolator
@@ -49,7 +51,7 @@ import kotlin.concurrent.thread
 
 /** ADB utility with persistent bottom tabs. All remote commands require a user-authorized ADB connection. */
 class MainActivity : AppCompatActivity() {
-    private lateinit var statusView: TextView
+    private var lastStatus = ""
     private lateinit var rootFrame: FrameLayout
     private var toastView: TextView? = null
     private val toastHide = Runnable { dismissToast() }
@@ -73,9 +75,6 @@ class MainActivity : AppCompatActivity() {
     private var fileOutput: TextView? = null
     private var packageFilter: EditText? = null
     private var processFilter: EditText? = null
-    private var screenImage: ImageView? = null
-    private var screenAuto = false
-    private val screenBusy = AtomicBoolean(false)
     private val handler = Handler(Looper.getMainLooper())
     private var pendingPushPath: String? = null
     private var pendingPullPath: String? = null
@@ -110,7 +109,6 @@ class MainActivity : AppCompatActivity() {
         val last = prefs.getString(PREF_LAST_HOST, null)
         if (!autoReconnect || last.isNullOrBlank() || adb != null || isFinishing || isDestroyed) return
         if (!scanning.compareAndSet(false, true)) return
-        setStatus("Looking for $last...")
         var matched = false
         scanForAdbDevices(
             onFound = { ip ->
@@ -143,7 +141,7 @@ class MainActivity : AppCompatActivity() {
         val topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(16), dp(12), dp(16), dp(4))
+            setPadding(dp(16), dp(6), dp(16), dp(4))
         }
         ipChip = TextView(this).apply {
             textSize = 13.5f
@@ -164,18 +162,8 @@ class MainActivity : AppCompatActivity() {
         topBar.addView(ipChip, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(8) })
         topBar.addView(connectButton, LinearLayout.LayoutParams(dp(44), dp(40)))
 
-        statusView = TextView(this).apply {
-            text = "Not connected"
-            textSize = 13f
-            maxLines = 2
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            setPadding(dp(16), dp(2), dp(16), dp(10))
-            setTextColor(color(R.color.md_on_surface_variant))
-        }
-
         content = FrameLayout(this)
         page.addView(topBar, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT))
-        page.addView(statusView, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT))
         page.addView(content, LinearLayout.LayoutParams(-1, 0, 1f))
 
         // .nav-bar: a floating pill, centered, sitting above the content near the bottom.
@@ -240,14 +228,14 @@ class MainActivity : AppCompatActivity() {
 
     private class PageRefs(
         val filePathEdit: EditText?, val fileListContainer: LinearLayout?, val fileOutput: TextView?,
-        val packageFilter: EditText?, val processFilter: EditText?, val screenImage: ImageView?
+        val packageFilter: EditText?, val processFilter: EditText?
     )
-    private fun saveRefs() = PageRefs(filePathEdit, fileListContainer, fileOutput, packageFilter, processFilter, screenImage)
+    private fun saveRefs() = PageRefs(filePathEdit, fileListContainer, fileOutput, packageFilter, processFilter)
     private fun restoreRefs(r: PageRefs) {
         filePathEdit = r.filePathEdit; fileListContainer = r.fileListContainer; fileOutput = r.fileOutput
-        packageFilter = r.packageFilter; processFilter = r.processFilter; screenImage = r.screenImage
+        packageFilter = r.packageFilter; processFilter = r.processFilter
     }
-    private fun clearRefs() { filePathEdit = null; fileListContainer = null; fileOutput = null; packageFilter = null; processFilter = null; screenImage = null }
+    private fun clearRefs() { filePathEdit = null; fileListContainer = null; fileOutput = null; packageFilter = null; processFilter = null }
 
     private var currentPage: View? = null
     private var fabView: View? = null
@@ -256,6 +244,7 @@ class MainActivity : AppCompatActivity() {
     /** Builds one tab's page. Leaves that page's view refs in the member fields. */
     private fun buildPage(index: Int): View {
         if (index == TAB_TERMINAL) return buildTerminalPage()
+        if (index == TAB_SCREEN) return buildScreenPage()
         val scroll = ScrollView(this)
         val body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -268,7 +257,6 @@ class MainActivity : AppCompatActivity() {
             TAB_PROCESSES -> buildProcessesTab(body)
             TAB_COMMANDS -> buildCommandsTab(body)
             TAB_REMOTE -> buildRemoteTab(body)
-            TAB_SCREEN -> buildScreenTab(body)
             TAB_FILES -> buildFilesTab(body)
         }
         return scroll
@@ -308,7 +296,6 @@ class MainActivity : AppCompatActivity() {
                 page.animate().translationX(0f).setDuration(duration).setInterpolator(slideInterpolator).start()
             } else content.removeView(old)
         }
-        if (index == TAB_SCREEN && screenAuto) handler.post { scheduleScreenCapture() }
     }
 
     // ---- Finger-following swipe between neighbouring tabs ----
@@ -426,7 +413,6 @@ class MainActivity : AppCompatActivity() {
             selectedTab = target
             savedNeighbor?.let { restoreRefs(it) }
             updateTabHighlight()
-            if (target == TAB_SCREEN && screenAuto) handler.post { scheduleScreenCapture() }
         } else {
             val duration = (220f * Math.abs(offset) / w).toLong().coerceAtLeast(60L)
             page.animate().translationX(0f).setDuration(duration).setInterpolator(slideInterpolator).start()
@@ -582,19 +568,42 @@ class MainActivity : AppCompatActivity() {
 
     // ─────────────────────────────── Remote control ───────────────────────────────
     private fun buildRemoteTab(root: LinearLayout) {
-        title(root, "Remote")
-        paragraph(root, "Connect first, then use the pad.")
-        val pad = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER }
-        pad.addView(button("Up") { sendKey(KeyEvent.UP) }, centeredParams(74))
-        val middle = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
-        middle.addView(button("Left") { sendKey(KeyEvent.LEFT) }, centeredParams(74))
-        middle.addView(button("OK") { sendKey(KeyEvent.CENTER) }, centeredParams(74))
-        middle.addView(button("Right") { sendKey(KeyEvent.RIGHT) }, centeredParams(74))
-        pad.addView(middle)
-        pad.addView(button("Down") { sendKey(KeyEvent.DOWN) }, centeredParams(74))
-        root.addView(pad, matchWrap())
-        row(root, listOf("Back" to { sendKey(KeyEvent.BACK) }, "Home" to { sendKey(KeyEvent.HOME) }, "Vol-" to { sendKey(KeyEvent.VOLUME_DOWN) }, "Vol+" to { sendKey(KeyEvent.VOLUME_UP) }))
-        val text = edit(root, "Type text to send to the TV", "", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES)
+        val screenW = resources.displayMetrics.widthPixels
+        val gap = dp(10)
+        val cell = minOf(dp(112), (screenW - dp(32) - gap * 2) / 3)
+        fun key(iconRes: Int, desc: String, light: Boolean, rotation: Float = 0f, code: Int): ImageView = ImageView(this).apply {
+            setImageResource(iconRes)
+            rotation.takeIf { it != 0f }?.let { this.rotation = it }
+            scaleType = ImageView.ScaleType.CENTER
+            imageTintList = android.content.res.ColorStateList.valueOf(color(if (light) R.color.md_on_primary_container else R.color.md_on_secondary_container))
+            contentDescription = desc
+            val r = dp(22).toFloat()
+            background = ui.stateBg(if (light) R.color.md_primary_container else R.color.md_secondary_container, floatArrayOf(r, r, r, r, r, r, r, r))
+            isClickable = true; isFocusable = true
+            setOnClickListener { sendKey(code) }
+        }.withPressAnimation()
+        fun gridRow(vararg views: View?): LinearLayout = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER
+            views.forEachIndexed { i, v ->
+                val lp = LinearLayout.LayoutParams(cell, cell).apply { if (i > 0) marginStart = gap }
+                addView(v ?: View(this@MainActivity), lp)
+            }
+        }
+        fun lp() = LinearLayout.LayoutParams(-2, -2).apply { gravity = Gravity.CENTER_HORIZONTAL; topMargin = gap }
+        // Arrows are light rounded squares; one arrow icon rotated for each direction.
+        root.addView(gridRow(null, key(R.drawable.ic_arrow, "Up", true, 0f, KeyEvent.UP), null), lp().apply { topMargin = 0 })
+        root.addView(gridRow(
+            key(R.drawable.ic_arrow, "Left", true, 270f, KeyEvent.LEFT),
+            key(R.drawable.ic_ok, "OK", false, 0f, KeyEvent.CENTER),
+            key(R.drawable.ic_arrow, "Right", true, 90f, KeyEvent.RIGHT)), lp())
+        root.addView(gridRow(null, key(R.drawable.ic_arrow, "Down", true, 180f, KeyEvent.DOWN), null), lp())
+        root.addView(gridRow(
+            key(R.drawable.ic_back, "Back", false, 0f, KeyEvent.BACK),
+            key(R.drawable.ic_home, "Home", false, 0f, KeyEvent.HOME),
+            key(R.drawable.ic_vol_up, "Volume up", false, 0f, KeyEvent.VOLUME_UP)), lp().apply { topMargin = gap * 2 })
+        root.addView(gridRow(
+            key(R.drawable.ic_vol_down, "Volume down", false, 0f, KeyEvent.VOLUME_DOWN), null, null), lp())
+        val text = edit(root, "Type text to send", "", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES)
         button(root, "Send text") {
             val value = text.text.toString()
             if (value.isNotBlank()) {
@@ -668,7 +677,7 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     updateConnectionChip(); setStatus("Connected - $host:$port; fetching app icons...")
                     // Load packages (and icons) right away instead of waiting for a manual Refresh.
-                    if (selectedTab == TAB_PACKAGES || selectedTab == TAB_TERMINAL) renderTab(selectedTab)
+                    if (selectedTab == TAB_PACKAGES || selectedTab == TAB_TERMINAL || selectedTab == TAB_SCREEN) renderTab(selectedTab)
                 }
                 prefetchIconsAfterConnect()
             } catch (e: Exception) {
@@ -699,7 +708,7 @@ class MainActivity : AppCompatActivity() {
                 resetIconPrefetchState()
                 runOnUiThread {
                     updateConnectionChip(); setStatus("Connected over USB; fetching app icons...")
-                    if (selectedTab == TAB_PACKAGES || selectedTab == TAB_TERMINAL) renderTab(selectedTab)
+                    if (selectedTab == TAB_PACKAGES || selectedTab == TAB_TERMINAL || selectedTab == TAB_SCREEN) renderTab(selectedTab)
                 }
                 prefetchIconsAfterConnect()
             } catch (e: Exception) { runOnUiThread { setStatus("USB connection failed: ${e.message}") } }
@@ -1133,7 +1142,7 @@ class MainActivity : AppCompatActivity() {
         val t = terminal ?: return@Runnable
         val view = terminalView ?: return@Runnable
         view.text = t.text()
-        terminalScroll?.post { terminalScroll?.fullScroll(View.FOCUS_DOWN) }
+        terminalScroll?.post { terminalScroll?.let { sv -> sv.getChildAt(0)?.let { c -> sv.scrollTo(0, maxOf(0, c.height - sv.height)) } } }
     }
 
     private fun scheduleTerminalRefresh() {
@@ -1171,7 +1180,7 @@ class MainActivity : AppCompatActivity() {
             addView(output)
         }
         terminalView = output; terminalScroll = scroll
-        scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+        scroll.post { scroll.getChildAt(0)?.let { c -> scroll.scrollTo(0, maxOf(0, c.height - scroll.height)) } }
         page.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f).apply { bottomMargin = dp(8) })
 
         fun key(label: String, bytes: ByteArray) = ui.pill(label) { terminal?.send(bytes) ?: toast("Not connected", error = true) }.apply {
@@ -1200,7 +1209,11 @@ class MainActivity : AppCompatActivity() {
         }
         input.setOnEditorActionListener { _, actionId, event ->
             if (actionId == android.view.inputmethod.EditorInfo.IME_ACTION_SEND ||
-                (event != null && event.keyCode == android.view.KeyEvent.KEYCODE_ENTER && event.action == android.view.KeyEvent.ACTION_DOWN)) { submit(); true } else false
+                (event != null && event.keyCode == android.view.KeyEvent.KEYCODE_ENTER)) {
+                // Enter runs the line but keeps the keyboard (and focus) open.
+                if (event == null || event.action == android.view.KeyEvent.ACTION_DOWN) submit()
+                true
+            } else false
         }
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         bar.addView(input, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(8) })
@@ -1244,53 +1257,94 @@ class MainActivity : AppCompatActivity() {
         return currentPage?.let { search(it) }
     }
 
-    // ─────────────────────────────────── Screen capture / polling mirror ───────────────────────────────────
-    private fun buildScreenTab(root: LinearLayout) {
-        title(root, "Screen")
-        paragraph(root, "Polls screencap; not a live stream. Needs base64 on the device.")
-        val image = ImageView(this).apply {
-            adjustViewBounds = true
-            scaleType = ImageView.ScaleType.FIT_CENTER
-            contentDescription = "Target device screenshot"
-            setBackgroundColor(0xFF202124.toInt())
-            minimumHeight = dp(220)
-        }
-        screenImage = image
-        root.addView(image, LinearLayout.LayoutParams(-1, dp(320)))
-        row(root, listOf(
-            "Capture" to { captureScreen() },
-            (if (screenAuto) "Stop auto-refresh" else "Auto-refresh every 2s") to {
-                screenAuto = !screenAuto
-                renderTab(TAB_SCREEN)
+    // ─────────────────────────────────── Screen mirror ───────────────────────────────────
+    private var mirror: ScreenMirror? = null
+    private var mirrorTexture: TextureView? = null
+    private var mirrorHolder: FrameLayout? = null
+    private var mirrorSurface: Surface? = null
+    private var mirrorW = 0
+    private var mirrorH = 0
+    private var lastShot: ByteArray? = null
+
+    private fun buildScreenPage(): View {
+        val page = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(8), dp(16), dp(150)) }
+        val holder = FrameLayout(this).apply { setBackgroundColor(0xFF000000.toInt()) }
+        val tv = TextureView(this)
+        mirrorHolder = holder; mirrorTexture = tv
+        holder.addView(tv, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+        var downX = 0f; var downY = 0f
+        tv.setOnTouchListener { v, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> { downX = e.x; downY = e.y }
+                MotionEvent.ACTION_UP -> {
+                    val m = mirror
+                    if (m != null && v.width > 0 && v.height > 0 && m.deviceWidth > 0) {
+                        val x = (e.x * m.deviceWidth / v.width).toInt()
+                        val y = (e.y * m.deviceHeight / v.height).toInt()
+                        val moved = Math.hypot((e.x - downX).toDouble(), (e.y - downY).toDouble()) > dp(12)
+                        if (moved) {
+                            val x0 = (downX * m.deviceWidth / v.width).toInt(); val y0 = (downY * m.deviceHeight / v.height).toInt()
+                            runShell("input swipe $x0 $y0 $x $y 200")
+                        } else runShell("input tap $x $y")
+                    }
+                }
             }
-        ))
-        button(root, "Save screenshot to phone") { saveCurrentScreenshot() }
+            true
+        }
+        tv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(st: android.graphics.SurfaceTexture, w: Int, h: Int) {
+                mirrorSurface = Surface(st); startMirror()
+            }
+            override fun onSurfaceTextureSizeChanged(st: android.graphics.SurfaceTexture, w: Int, h: Int) {}
+            override fun onSurfaceTextureDestroyed(st: android.graphics.SurfaceTexture): Boolean {
+                stopMirror(); mirrorSurface?.release(); mirrorSurface = null; return true
+            }
+            override fun onSurfaceTextureUpdated(st: android.graphics.SurfaceTexture) {}
+        }
+        page.addView(holder, LinearLayout.LayoutParams(-1, 0, 1f).apply { bottomMargin = dp(10) })
+        holder.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> fitMirror() }
+        page.addView(ui.actionRow(
+            ui.iconPill(R.drawable.ic_refresh, "Restart mirror", primary = true) { stopMirror(); startMirror() },
+            ui.iconPill(R.drawable.ic_stop, "Stop mirror") { stopMirror() },
+            ui.iconPill(R.drawable.ic_screen, "Save screenshot") { takeScreenshot() }
+        ), LinearLayout.LayoutParams(-1, -2))
+        return page
     }
 
-    private var lastScreenshot: ByteArray? = null
-    private fun captureScreen() {
-        val target = screenImage ?: return
-        if (!screenBusy.compareAndSet(false, true)) return
+    private fun fitMirror() {
+        val holder = mirrorHolder ?: return
+        val tv = mirrorTexture ?: return
+        if (mirrorW <= 0 || mirrorH <= 0 || holder.width <= 0 || holder.height <= 0) return
+        val scale = minOf(holder.width / mirrorW.toFloat(), holder.height / mirrorH.toFloat())
+        val lp = FrameLayout.LayoutParams((mirrorW * scale).toInt(), (mirrorH * scale).toInt(), Gravity.CENTER)
+        if (tv.layoutParams.width != lp.width || tv.layoutParams.height != lp.height) tv.layoutParams = lp
+    }
+
+    private fun startMirror() {
+        stopMirror()
+        val conn = adb ?: return
+        val surface = mirrorSurface ?: return
+        mirror = ScreenMirror(conn, surface,
+            onSize = { w, h -> runOnUiThread { mirrorW = w; mirrorH = h; fitMirror() } },
+            onError = { msg -> runOnUiThread { toast("Mirror: $msg", error = true) } }).also { it.start() }
+    }
+
+    private fun stopMirror() { mirror?.stop(); mirror = null }
+
+    private fun takeScreenshot() {
+        if (adb == null) { toast("Not connected", error = true); return }
         runShell("screencap -p | base64") { raw ->
             try {
                 val bytes = android.util.Base64.decode(raw.filterNot { it.isWhitespace() }, android.util.Base64.DEFAULT)
-                val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                if (bitmap == null) toast("Could not decode the image. The device may be missing the base64 command.")
-                else { lastScreenshot = bytes; target.setImageBitmap(bitmap) }
-            } catch (e: Exception) { toast("Screen capture failed: ${e.message}") }
-            finally { screenBusy.set(false); if (screenAuto && selectedTab == TAB_SCREEN) handler.postDelayed({ scheduleScreenCapture() }, 2000) }
+                if (BitmapFactory.decodeByteArray(bytes, 0, bytes.size) == null) { toast("Could not decode the screenshot", error = true); return@runShell }
+                lastShot = bytes
+                val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE); type = "image/png"; putExtra(Intent.EXTRA_TITLE, "screen-${System.currentTimeMillis()}.png")
+                }
+                pendingScreenshot = bytes
+                startActivityForResult(intent, REQUEST_SAVE_SCREEN)
+            } catch (e: Exception) { toast("Screenshot failed: ${e.message}", error = true) }
         }
-    }
-
-    private fun scheduleScreenCapture() { if (screenAuto && selectedTab == TAB_SCREEN) captureScreen() }
-
-    private fun saveCurrentScreenshot() {
-        val bytes = lastScreenshot ?: run { toast("Capture a screenshot first"); return }
-        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE); type = "image/png"; putExtra(Intent.EXTRA_TITLE, "tv-screen-${System.currentTimeMillis()}.png")
-        }
-        pendingScreenshot = bytes
-        startActivityForResult(intent, REQUEST_SAVE_SCREEN)
     }
     private var pendingScreenshot: ByteArray? = null
 
@@ -1642,7 +1696,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun requireAdb(): AdbConnection = adb ?: throw IOException("Not connected")
-    private fun setStatus(value: String) { statusView.text = value }
+    /** Status messages are shown as the in-app toast; identical repeats are dropped. */
+    private fun setStatus(value: String) {
+        if (value == lastStatus) return
+        lastStatus = value
+        toast(value)
+    }
 
     /** In-app toast pinned to the top of this Activity's own view tree (not android.widget.Toast),
      *  so it disappears with the app: removed on pause/stop/destroy instead of lingering. */
@@ -1678,7 +1737,13 @@ class MainActivity : AppCompatActivity() {
         toastView = null
     }
 
+    override fun onResume() {
+        super.onResume()
+        if (selectedTab == TAB_SCREEN && mirror == null && mirrorSurface != null) startMirror()
+    }
+
     override fun onPause() {
+        stopMirror()
         dismissToast()
         super.onPause()
     }
@@ -1757,7 +1822,7 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         // Without this, auto-refresh screenshots keep firing via `handler` and the ADB
         // socket/read-thread in `adb` stay alive after the Activity is gone.
-        screenAuto = false
+        stopMirror()
         dismissToast()
         handler.removeCallbacksAndMessages(null)
         autoReconnect = false
