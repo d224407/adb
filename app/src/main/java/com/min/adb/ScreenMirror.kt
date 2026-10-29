@@ -14,9 +14,13 @@ import kotlin.concurrent.thread
 class ScreenMirror(
     private val connection: AdbConnection,
     private val surface: Surface,
+    private val options: Options,
     private val onSize: (width: Int, height: Int) -> Unit,
     private val onError: (String) -> Unit
 ) {
+    /** maxSize 0 = native resolution. */
+    data class Options(val maxSize: Int, val bitRate: Int)
+
     @Volatile private var stopped = false
     @Volatile var deviceWidth = 0
         private set
@@ -37,7 +41,7 @@ class ScreenMirror(
         try {
             val (w, h) = queryDisplaySize()
             deviceWidth = w; deviceHeight = h
-            val scale = minOf(1f, MAX_EDGE / maxOf(w, h).toFloat())
+            val scale = if (options.maxSize <= 0) 1f else minOf(1f, options.maxSize / maxOf(w, h).toFloat())
             val vw = maxOf(16, (w * scale).toInt() and 7.inv())
             val vh = maxOf(16, (h * scale).toInt() and 7.inv())
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, vw, vh).apply {
@@ -54,7 +58,7 @@ class ScreenMirror(
 
             var pts = 0L
             while (!stopped) {
-                val stream = connection.open("exec:screenrecord --output-format=h264 --bit-rate $BIT_RATE --size ${vw}x$vh --time-limit 175 -")
+                val stream = connection.open("exec:screenrecord --output-format=h264 --bit-rate ${options.bitRate} --size ${vw}x$vh --time-limit 175 -")
                 var nals = 0
                 val head = StringBuilder()
                 val splitter = NalSplitter { nal ->
@@ -153,10 +157,5 @@ class ScreenMirror(
             val out = if (nal[2].toInt() == 1) byteArrayOf(0) + nal else nal
             onNal(out)
         }
-    }
-
-    private companion object {
-        const val MAX_EDGE = 1280f
-        const val BIT_RATE = 6_000_000
     }
 }

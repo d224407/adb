@@ -178,14 +178,22 @@ class MainActivity : AppCompatActivity() {
         }
         navScroll.addView(tabsRow)
         tabNames.forEachIndexed { index, label ->
-            val item = ImageView(this).apply {
-                setImageResource(tabIcons[index])
-                scaleType = ImageView.ScaleType.CENTER
+            val item = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER
+                minimumWidth = dp(56)
                 contentDescription = label
                 isClickable = true; isFocusable = true
                 setOnClickListener { renderTab(index) }
+                addView(ImageView(context).apply {
+                    setImageResource(tabIcons[index]); scaleType = ImageView.ScaleType.CENTER
+                }, LinearLayout.LayoutParams(dp(24), dp(24)))
+                addView(TextView(context).apply {
+                    text = label; textSize = 13f; maxLines = 1; visibility = View.GONE
+                    setPadding(dp(6), 0, 0, 0)
+                }, LinearLayout.LayoutParams(-2, -2))
             }
-            tabsRow.addView(item, LinearLayout.LayoutParams(dp(56), dp(44)).apply { if (index < tabNames.size - 1) marginEnd = dp(2) })
+            tabsRow.addView(item, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)).apply { if (index < tabNames.size - 1) marginEnd = dp(2) })
         }
         frame.addView(page, FrameLayout.LayoutParams(-1, -1))
         frame.addView(
@@ -285,15 +293,12 @@ class MainActivity : AppCompatActivity() {
         if (old != null) {
             val w = content.width.toFloat()
             if (index != previous && w > 0f) {
-                // Slides through the tabs in between: distance = number of tabs crossed, so the
-                // duration grows with it (same speed whether you hop one tab or four).
+                // Same slide for every tab: one page width, fixed duration.
                 val dir = if (index > previous) 1 else -1
-                val dist = Math.abs(index - previous)
-                val duration = (200L * dist).coerceIn(200L, 800L)
-                page.translationX = dir * w * dist
-                old.animate().translationX(-dir * w * dist).setDuration(duration).setInterpolator(slideInterpolator)
+                page.translationX = dir * w
+                old.animate().translationX(-dir * w).setDuration(SLIDE_MS).setInterpolator(slideInterpolator)
                     .withEndAction { content.removeView(old) }.start()
-                page.animate().translationX(0f).setDuration(duration).setInterpolator(slideInterpolator).start()
+                page.animate().translationX(0f).setDuration(SLIDE_MS).setInterpolator(slideInterpolator).start()
             } else content.removeView(old)
         }
     }
@@ -424,13 +429,18 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateTabHighlight() {
         if (!::tabsRow.isInitialized) return
+        android.transition.TransitionManager.beginDelayedTransition(tabsRow)
         for (i in 0 until tabsRow.childCount) {
-            val view = tabsRow.getChildAt(i) as ImageView
+            val view = tabsRow.getChildAt(i) as LinearLayout
             val active = i == selectedTab
+            val tint = color(if (active) R.color.md_on_secondary_container else R.color.md_on_surface_variant)
             view.background = if (active) ui.pillBg(R.color.md_secondary_container, 200) else null
-            view.imageTintList = android.content.res.ColorStateList.valueOf(color(if (active) R.color.md_on_secondary_container else R.color.md_on_surface_variant))
-            fabView?.visibility = if (selectedTab == TAB_TERMINAL) View.GONE else View.VISIBLE
+            view.setPadding(if (active) dp(14) else 0, 0, if (active) dp(16) else 0, 0)
+            (view.getChildAt(0) as ImageView).imageTintList = android.content.res.ColorStateList.valueOf(tint)
+            (view.getChildAt(1) as TextView).apply { visibility = if (active) View.VISIBLE else View.GONE; setTextColor(tint) }
         }
+        // The sideload "+" belongs to Packages only.
+        fabView?.visibility = if (selectedTab == TAB_PACKAGES) View.VISIBLE else View.GONE
         centerSelectedTab()
     }
 
@@ -438,10 +448,10 @@ class MainActivity : AppCompatActivity() {
     private fun centerSelectedTab() {
         if (!::navScroll.isInitialized || selectedTab >= tabsRow.childCount) return
         val item = tabsRow.getChildAt(selectedTab)
-        navScroll.post {
+        navScroll.postDelayed({
             val target = item.left + item.width / 2 - navScroll.width / 2
             navScroll.smoothScrollTo(target.coerceAtLeast(0), 0)
-        }
+        }, 120)
     }
 
     // ─────────────────────────────────── Material tokens / helpers ───────────────────────────────────
@@ -1265,6 +1275,55 @@ class MainActivity : AppCompatActivity() {
     private var mirrorW = 0
     private var mirrorH = 0
     private var lastShot: ByteArray? = null
+    private val mirrorSizes = intArrayOf(0, 1920, 1280, 1024, 720, 480)
+    private val mirrorRates = intArrayOf(2, 4, 8, 16, 24)
+    private var touchesOn = false
+    private var awakeOn = false
+
+    private fun mirrorOpts(): ScreenMirror.Options = ScreenMirror.Options(
+        prefs.getInt("m_size", 1280), prefs.getInt("m_rate", 8) * 1_000_000)
+
+    private fun showMirrorSettings() {
+        val sizeLabels = mirrorSizes.map { if (it == 0) "Native" else "${it}px" }.toTypedArray()
+        val rateLabels = mirrorRates.map { "$it Mbps" }.toTypedArray()
+        var size = mirrorSizes.indexOf(prefs.getInt("m_size", 1280)).coerceAtLeast(0)
+        var rate = mirrorRates.indexOf(prefs.getInt("m_rate", 8)).coerceAtLeast(0)
+        var touches = prefs.getBoolean("m_touches", false)
+        var awake = prefs.getBoolean("m_awake", false)
+        fun spinner(items: Array<String>, sel: Int, on: (Int) -> Unit) = android.widget.Spinner(this).apply {
+            adapter = android.widget.ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, items)
+            setSelection(sel)
+            onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+                override fun onItemSelected(p: android.widget.AdapterView<*>?, v: View?, pos: Int, id: Long) = on(pos)
+                override fun onNothingSelected(p: android.widget.AdapterView<*>?) {}
+            }
+        }
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), 0) }
+        box.addView(ui.label("Max size (long edge)", 13f, R.color.md_on_surface_variant))
+        box.addView(spinner(sizeLabels, size) { size = it })
+        box.addView(ui.label("Bit rate", 13f, R.color.md_on_surface_variant))
+        box.addView(spinner(rateLabels, rate) { rate = it })
+        box.addView(android.widget.CheckBox(this).apply { text = "Show touches"; isChecked = touches; setOnCheckedChangeListener { _, c -> touches = c } })
+        box.addView(android.widget.CheckBox(this).apply { text = "Stay awake"; isChecked = awake; setOnCheckedChangeListener { _, c -> awake = c } })
+        AlertDialog.Builder(this).setTitle("Mirror settings").setView(box).setNegativeButton("Cancel", null)
+            .setPositiveButton("Apply") { _, _ ->
+                prefs.edit().putInt("m_size", mirrorSizes[size]).putInt("m_rate", mirrorRates[rate])
+                    .putBoolean("m_touches", touches).putBoolean("m_awake", awake).apply()
+                startMirror()
+            }.show()
+    }
+
+    /** Applies the device-side options and remembers what to undo when mirroring stops. */
+    private fun applyDeviceOptions() {
+        val t = prefs.getBoolean("m_touches", false); val a = prefs.getBoolean("m_awake", false)
+        if (t && !touchesOn) { touchesOn = true; runShell("settings put system show_touches 1") }
+        if (a && !awakeOn) { awakeOn = true; runShell("settings put global stay_on_while_plugged_in 7") }
+    }
+
+    private fun restoreDeviceOptions() {
+        if (touchesOn) { touchesOn = false; runShell("settings put system show_touches 0") }
+        if (awakeOn) { awakeOn = false; runShell("settings put global stay_on_while_plugged_in 0") }
+    }
 
     private fun buildScreenPage(): View {
         val page = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(8), dp(16), dp(150)) }
@@ -1306,7 +1365,8 @@ class MainActivity : AppCompatActivity() {
         page.addView(ui.actionRow(
             ui.iconPill(R.drawable.ic_refresh, "Restart mirror", primary = true) { stopMirror(); startMirror() },
             ui.iconPill(R.drawable.ic_stop, "Stop mirror") { stopMirror() },
-            ui.iconPill(R.drawable.ic_screen, "Save screenshot") { takeScreenshot() }
+            ui.iconPill(R.drawable.ic_screen, "Save screenshot") { takeScreenshot() },
+            ui.iconPill(R.drawable.ic_settings, "Mirror settings") { showMirrorSettings() }
         ), LinearLayout.LayoutParams(-1, -2))
         return page
     }
@@ -1324,12 +1384,13 @@ class MainActivity : AppCompatActivity() {
         stopMirror()
         val conn = adb ?: return
         val surface = mirrorSurface ?: return
-        mirror = ScreenMirror(conn, surface,
+        applyDeviceOptions()
+        mirror = ScreenMirror(conn, surface, mirrorOpts(),
             onSize = { w, h -> runOnUiThread { mirrorW = w; mirrorH = h; fitMirror() } },
             onError = { msg -> runOnUiThread { toast("Mirror: $msg", error = true) } }).also { it.start() }
     }
 
-    private fun stopMirror() { mirror?.stop(); mirror = null }
+    private fun stopMirror() { mirror?.stop(); mirror = null; restoreDeviceOptions() }
 
     private fun takeScreenshot() {
         if (adb == null) { toast("Not connected", error = true); return }
@@ -1835,6 +1896,7 @@ class MainActivity : AppCompatActivity() {
     companion object {
         // Tab indices, matching the order in `tabNames` above.
         private const val TAB_PACKAGES = 0
+        private const val SLIDE_MS = 260L
         private const val TAB_TERMINAL = 1
         private const val TAB_COMMANDS = 2
         private const val TAB_PROCESSES = 3
