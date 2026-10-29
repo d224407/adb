@@ -37,6 +37,11 @@ class ScreenMirror(
     }
 
     private fun run() {
+        // One mirror at a time: a new decoder can't attach to the surface until the old one is released.
+        synchronized(LOCK) { if (!stopped) runLocked() }
+    }
+
+    private fun runLocked() {
         var c: MediaCodec? = null
         try {
             val (w, h) = queryDisplaySize()
@@ -157,5 +162,9 @@ class ScreenMirror(
             val out = if (nal[2].toInt() == 1) byteArrayOf(0) + nal else nal
             onNal(out)
         }
+    }
+
+    private companion object {
+        val LOCK = Any()
     }
 }

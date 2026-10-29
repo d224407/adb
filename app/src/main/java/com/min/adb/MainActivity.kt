@@ -1377,7 +1377,7 @@ class MainActivity : AppCompatActivity() {
         if (mirrorW <= 0 || mirrorH <= 0 || holder.width <= 0 || holder.height <= 0) return
         val scale = minOf(holder.width / mirrorW.toFloat(), holder.height / mirrorH.toFloat())
         val lp = FrameLayout.LayoutParams((mirrorW * scale).toInt(), (mirrorH * scale).toInt(), Gravity.CENTER)
-        if (tv.layoutParams.width != lp.width || tv.layoutParams.height != lp.height) tv.layoutParams = lp
+        if (tv.layoutParams.width != lp.width || tv.layoutParams.height != lp.height) tv.post { tv.layoutParams = lp }
     }
 
     private fun startMirror() {
