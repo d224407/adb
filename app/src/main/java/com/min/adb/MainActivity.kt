@@ -63,6 +63,29 @@ class MainActivity : AppCompatActivity() {
     private val ui by lazy { Ui(this) }
     private var adb: AdbConnection? = null
     private var selectedTab = TAB_PACKAGES
+    private val tabHistory = ArrayDeque<Int>()
+    private var filesReload: ((String) -> Unit)? = null
+
+    private fun pushHistory(tab: Int) {
+        tabHistory.remove(tab)
+        tabHistory.addLast(tab)
+        while (tabHistory.size > 12) tabHistory.removeFirst()
+    }
+
+    /** Back: Files goes up a folder first, then tabs go back through the ones visited before exiting. */
+    private fun handleBack() {
+        if (selectedTab == TAB_FILES) {
+            val edit = filePathEdit
+            val reload = filesReload
+            if (edit != null && reload != null) {
+                val cur = edit.text.toString().trim().ifBlank { "/" }
+                val up = parentPath(cur)
+                if (up != cur && cur != "/") { edit.setText(up); reload(up); return }
+            }
+        }
+        if (tabHistory.isNotEmpty()) renderTab(tabHistory.removeLast(), record = false)
+        else finish()
+    }
     private var remoteIp = ""
     private var remotePort = 5555
     private var packageShowSystem = false
@@ -225,6 +248,9 @@ class MainActivity : AppCompatActivity() {
             marginEnd = dp(16)
         })
         setContentView(frame)
+        onBackPressedDispatcher.addCallback(this, object : androidx.activity.OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() = handleBack()
+        })
         updateTabHighlight()
         updateConnectionChip()
     }
@@ -267,6 +293,11 @@ class MainActivity : AppCompatActivity() {
             TAB_REMOTE -> buildRemoteTab(body)
             TAB_FILES -> buildFilesTab(body)
         }
+        // Content eases in, a little later for each item.
+        for (i in 0 until body.childCount) body.getChildAt(i).apply {
+            alpha = 0f; translationY = dp(16).toFloat()
+            animate().alpha(1f).translationY(0f).setStartDelay(minOf(i, 10) * 25L).setDuration(220).start()
+        }
         return scroll
     }
 
@@ -279,11 +310,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun renderTab(index: Int) {
+    private fun renderTab(index: Int, record: Boolean = true) {
         cancelDrag()
         settlePages()
         val previous = selectedTab
         val old = currentPage
+        if (record && index != previous) pushHistory(previous)
         selectedTab = index
         updateTabHighlight()
         clearRefs()
@@ -415,6 +447,7 @@ class MainActivity : AppCompatActivity() {
                 .withEndAction { content.removeView(page) }.start()
             neighbor.animate().translationX(0f).setDuration(duration).setInterpolator(slideInterpolator).start()
             currentPage = neighbor
+            pushHistory(selectedTab)
             selectedTab = target
             savedNeighbor?.let { restoreRefs(it) }
             updateTabHighlight()
@@ -887,7 +920,7 @@ class MainActivity : AppCompatActivity() {
         val actions = ui.actionRow(
             ui.iconPill(R.drawable.ic_launch, "Launch") { runCommand("monkey -p ${shellQuote(pkg)} -c android.intent.category.LAUNCHER 1") { toast(shortResult(it, "Launched $pkg")) } },
             ui.iconPill(R.drawable.ic_stop, "Force stop") { runCommand("am force-stop ${shellQuote(pkg)}") { toast(shortResult(it, "Stopped $pkg")) } },
-            ui.iconPill(R.drawable.ic_power, "Enable") { runCommand("pm enable ${shellQuote(pkg)}") { toast(shortResult(it, "Enabled $pkg")) } },
+            ui.iconPill(R.drawable.ic_enabled, "Enable") { runCommand("pm enable ${shellQuote(pkg)}") { toast(shortResult(it, "Enabled $pkg")) } },
             ui.iconPill(R.drawable.ic_disabled, "Disable") {
                 val disable = { runCommand("pm disable-user --user 0 ${shellQuote(pkg)}") { toast(shortResult(it, "Disabled $pkg")) } }
                 // Only system packages get the warning; user apps are disabled straight away.
@@ -1422,6 +1455,7 @@ class MainActivity : AppCompatActivity() {
         lateinit var reloadFn: (String) -> Unit
         reloadFn = { p -> listRemoteFiles(p) { entries -> renderFileEntries(entries, list, output, path, reloadFn) } }
         val reload = reloadFn
+        filesReload = reload
         row(root, listOf(
             "List" to { reload(path.text.toString()) },
             "Up to parent" to { path.setText(parentPath(path.text.toString())); reload(path.text.toString()) },

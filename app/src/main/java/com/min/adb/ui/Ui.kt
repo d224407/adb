@@ -228,6 +228,13 @@ class Ui(val ctx: Context) {
             isFocusable = true
             isClickable = true
             setOnClickListener { onClick() }
+            setOnTouchListener { v, e ->
+                when (e.action) {
+                    android.view.MotionEvent.ACTION_DOWN -> v.animate().scaleX(0.92f).scaleY(0.92f).setDuration(100).start()
+                    android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> v.animate().scaleX(1f).scaleY(1f).setDuration(140).start()
+                }
+                false
+            }
         }
 
     /** .action-row */
