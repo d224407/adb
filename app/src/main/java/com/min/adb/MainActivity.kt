@@ -67,9 +67,8 @@ class MainActivity : AppCompatActivity() {
     private var filesReload: ((String) -> Unit)? = null
 
     private fun pushHistory(tab: Int) {
-        tabHistory.remove(tab)
         tabHistory.addLast(tab)
-        while (tabHistory.size > 12) tabHistory.removeFirst()
+        while (tabHistory.size > 50) tabHistory.removeFirst()
     }
 
     /** Back: Files goes up a folder first, then tabs go back through the ones visited before exiting. */
@@ -83,6 +82,7 @@ class MainActivity : AppCompatActivity() {
                 if (up != cur && cur != "/") { edit.setText(up); reload(up); return }
             }
         }
+        while (tabHistory.isNotEmpty() && tabHistory.last() == selectedTab) tabHistory.removeLast()
         if (tabHistory.isNotEmpty()) renderTab(tabHistory.removeLast(), record = false)
         else finish()
     }
@@ -315,7 +315,7 @@ class MainActivity : AppCompatActivity() {
         settlePages()
         val previous = selectedTab
         val old = currentPage
-        if (record && index != previous) pushHistory(previous)
+        if (record && index != previous) { tabHistory.remove(index); pushHistory(previous) }
         selectedTab = index
         updateTabHighlight()
         clearRefs()
@@ -447,7 +447,7 @@ class MainActivity : AppCompatActivity() {
                 .withEndAction { content.removeView(page) }.start()
             neighbor.animate().translationX(0f).setDuration(duration).setInterpolator(slideInterpolator).start()
             currentPage = neighbor
-            pushHistory(selectedTab)
+            tabHistory.remove(target); pushHistory(selectedTab)
             selectedTab = target
             savedNeighbor?.let { restoreRefs(it) }
             updateTabHighlight()

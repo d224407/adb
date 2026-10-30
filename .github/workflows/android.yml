@@ -68,5 +68,5 @@ jobs:
           cp app/build/outputs/apk/release/*.apk "adb-$tag.apk"
           gh release create "$tag" "adb-$tag.apk" \
             --target "$GITHUB_SHA" \
-            --title "ADB $tag" \
+            --title "$tag" \
             --notes "$(git log -1 --pretty=%B)"
