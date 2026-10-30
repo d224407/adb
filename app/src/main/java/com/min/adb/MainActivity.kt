@@ -66,8 +66,10 @@ class MainActivity : AppCompatActivity() {
     private val tabHistory = ArrayDeque<Int>()
     private var filesReload: ((String) -> Unit)? = null
 
-    private fun pushHistory(tab: Int) {
-        tabHistory.addLast(tab)
+    /** Records a move; stepping back onto the previous tab cancels that step instead of stacking a detour. */
+    private fun recordMove(from: Int, to: Int) {
+        if (tabHistory.lastOrNull() == to) { tabHistory.removeLast(); return }
+        tabHistory.addLast(from)
         while (tabHistory.size > 50) tabHistory.removeFirst()
     }
 
@@ -315,7 +317,7 @@ class MainActivity : AppCompatActivity() {
         settlePages()
         val previous = selectedTab
         val old = currentPage
-        if (record && index != previous) { tabHistory.remove(index); pushHistory(previous) }
+        if (record && index != previous) recordMove(previous, index)
         selectedTab = index
         updateTabHighlight()
         clearRefs()
@@ -447,7 +449,7 @@ class MainActivity : AppCompatActivity() {
                 .withEndAction { content.removeView(page) }.start()
             neighbor.animate().translationX(0f).setDuration(duration).setInterpolator(slideInterpolator).start()
             currentPage = neighbor
-            tabHistory.remove(target); pushHistory(selectedTab)
+            recordMove(selectedTab, target)
             selectedTab = target
             savedNeighbor?.let { restoreRefs(it) }
             updateTabHighlight()
