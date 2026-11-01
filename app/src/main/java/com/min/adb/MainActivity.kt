@@ -487,20 +487,24 @@ class MainActivity : AppCompatActivity() {
             if (!reordering) return@setOnTouchListener false
             when (e.actionMasked) {
                 MotionEvent.ACTION_MOVE -> {
-                    val loc = IntArray(2); tabsRow.getLocationOnScreen(loc)
-                    val x = e.rawX - loc[0]
-                    val cur = tabsRow.indexOfChild(v)
-                    var to = cur
-                    for (i in 0 until tabsRow.childCount) {
-                        val c = tabsRow.getChildAt(i)
-                        if (x >= c.left && x <= c.right) { to = i; break }
-                    }
-                    if (to != cur) {
-                        android.transition.TransitionManager.beginDelayedTransition(tabsRow)
-                        val lp = v.layoutParams
-                        tabsRow.removeViewAt(cur)
-                        tabsRow.addView(v, to, lp)
-                        tabOrder.add(to, tabOrder.removeAt(cur))
+                    // Wait for the previous swap to be laid out so positions are current.
+                    if (!tabsRow.isLayoutRequested) {
+                        val loc = IntArray(2); tabsRow.getLocationOnScreen(loc)
+                        val x = e.rawX - loc[0]
+                        val cur = tabsRow.indexOfChild(v)
+                        // Move the neighbour past the dragged tab (the dragged view itself stays attached,
+                        // otherwise removing it would cancel the touch).
+                        if (x > v.right && cur < tabsRow.childCount - 1) {
+                            val n = tabsRow.getChildAt(cur + 1)
+                            val lp = n.layoutParams
+                            tabsRow.removeViewAt(cur + 1); tabsRow.addView(n, cur, lp)
+                            tabOrder.add(cur + 1, tabOrder.removeAt(cur))
+                        } else if (x < v.left && cur > 0) {
+                            val n = tabsRow.getChildAt(cur - 1)
+                            val lp = n.layoutParams
+                            tabsRow.removeViewAt(cur - 1); tabsRow.addView(n, cur, lp)
+                            tabOrder.add(cur - 1, tabOrder.removeAt(cur))
+                        }
                     }
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
