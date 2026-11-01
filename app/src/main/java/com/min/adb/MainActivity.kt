@@ -64,9 +64,18 @@ class MainActivity : AppCompatActivity() {
     private var adb: AdbConnection? = null
     private var selectedTab = TAB_PACKAGES
     private var lastBackAt = 0L
+    private var filesReload: ((String) -> Unit)? = null
 
-    /** Back goes to the home tab (Packages); there, a second press within 2s exits. */
+    /** Back: in Files it goes up a folder until /sdcard; otherwise to the home tab (Packages); there, a second press within 2s exits. */
     private fun handleBack() {
+        if (selectedTab == TAB_FILES) {
+            val edit = filePathEdit
+            val reload = filesReload
+            if (edit != null && reload != null) {
+                val cur = edit.text.toString().trim().trimEnd('/').ifBlank { "/" }
+                if (cur != "/sdcard" && cur != "/") { val up = parentPath(cur); edit.setText(up); reload(up); return }
+            }
+        }
         if (selectedTab != TAB_PACKAGES) { renderTab(TAB_PACKAGES); return }
         val now = android.os.SystemClock.uptimeMillis()
         if (now - lastBackAt < 2000) finish() else { lastBackAt = now; toast("Press back again to exit", durationMs = 2000) }
@@ -1441,6 +1450,7 @@ class MainActivity : AppCompatActivity() {
         lateinit var reloadFn: (String) -> Unit
         reloadFn = { p -> listRemoteFiles(p) { entries -> renderFileEntries(entries, list, output, path, reloadFn) } }
         val reload = reloadFn
+        filesReload = reload
         row(root, listOf(
             "List" to { reload(path.text.toString()) },
             "Up to parent" to { path.setText(parentPath(path.text.toString())); reload(path.text.toString()) },
