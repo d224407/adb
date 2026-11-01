@@ -63,17 +63,22 @@ class MainActivity : AppCompatActivity() {
     private val ui by lazy { Ui(this) }
     private var adb: AdbConnection? = null
     private var selectedTab = TAB_PACKAGES
-    private val tabHistory = ArrayDeque<Int>()
+    /** Tab ids in display order (user-sortable, saved in prefs). */
+    private val tabOrder = mutableListOf<Int>()
     private var filesReload: ((String) -> Unit)? = null
+    private var lastBackAt = 0L
+    private fun posOf(tab: Int) = tabOrder.indexOf(tab)
 
-    /** Records a move; stepping back onto the previous tab cancels that step instead of stacking a detour. */
-    private fun recordMove(from: Int, to: Int) {
-        if (tabHistory.lastOrNull() == to) { tabHistory.removeLast(); return }
-        tabHistory.addLast(from)
-        while (tabHistory.size > 50) tabHistory.removeFirst()
+    private fun loadTabOrder() {
+        tabOrder.clear()
+        val saved = prefs.getString("tab_order", null)?.split(",")?.mapNotNull { it.toIntOrNull() }.orEmpty()
+        tabOrder.addAll(saved.filter { it in tabNames.indices }.distinct())
+        for (id in tabNames.indices) if (id !in tabOrder) tabOrder.add(id)
     }
 
-    /** Back: Files goes up a folder first, then tabs go back through the ones visited before exiting. */
+    private fun saveTabOrder() { prefs.edit().putString("tab_order", tabOrder.joinToString(",")).apply() }
+
+    /** Back: Files goes up a folder first, then one tab to the left, then press twice to exit. */
     private fun handleBack() {
         if (selectedTab == TAB_FILES) {
             val edit = filePathEdit
@@ -84,9 +89,12 @@ class MainActivity : AppCompatActivity() {
                 if (up != cur && cur != "/") { edit.setText(up); reload(up); return }
             }
         }
-        while (tabHistory.isNotEmpty() && tabHistory.last() == selectedTab) tabHistory.removeLast()
-        if (tabHistory.isNotEmpty()) renderTab(tabHistory.removeLast(), record = false)
-        else finish()
+        // Back only ever moves one tab to the left; on the first tab it leaves the app.
+        val pos = posOf(selectedTab)
+        if (pos > 0) { renderTab(tabOrder[pos - 1]); return }
+        // First tab: a second Back within 2s exits.
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - lastBackAt < 2000) finish() else { lastBackAt = now; toast("Press back again to exit", durationMs = 2000) }
     }
     private var remoteIp = ""
     private var remotePort = 5555
@@ -202,23 +210,27 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(6), dp(6), dp(6), dp(6))
         }
         navScroll.addView(tabsRow)
-        tabNames.forEachIndexed { index, label ->
+        loadTabOrder()
+        tabOrder.forEach { id ->
+            val label = tabNames[id]
             val item = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER
                 minimumWidth = dp(56)
                 contentDescription = label
+                tag = id
                 isClickable = true; isFocusable = true
-                setOnClickListener { renderTab(index) }
+                setOnClickListener { renderTab(id) }
                 addView(ImageView(context).apply {
-                    setImageResource(tabIcons[index]); scaleType = ImageView.ScaleType.CENTER
+                    setImageResource(tabIcons[id]); scaleType = ImageView.ScaleType.CENTER
                 }, LinearLayout.LayoutParams(dp(24), dp(24)))
                 addView(TextView(context).apply {
                     text = label; textSize = 13f; maxLines = 1; visibility = View.GONE
                     setPadding(dp(6), 0, 0, 0)
                 }, LinearLayout.LayoutParams(-2, -2))
             }
-            tabsRow.addView(item, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)).apply { if (index < tabNames.size - 1) marginEnd = dp(2) })
+            enableTabReorder(item)
+            tabsRow.addView(item, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)).apply { marginEnd = dp(2) })
         }
         frame.addView(page, FrameLayout.LayoutParams(-1, -1))
         frame.addView(
@@ -312,12 +324,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun renderTab(index: Int, record: Boolean = true) {
+    private fun renderTab(index: Int) {
         cancelDrag()
         settlePages()
         val previous = selectedTab
         val old = currentPage
-        if (record && index != previous) recordMove(previous, index)
         selectedTab = index
         updateTabHighlight()
         clearRefs()
@@ -328,7 +339,7 @@ class MainActivity : AppCompatActivity() {
             val w = content.width.toFloat()
             if (index != previous && w > 0f) {
                 // Same slide for every tab: one page width, fixed duration.
-                val dir = if (index > previous) 1 else -1
+                val dir = if (posOf(index) > posOf(previous)) 1 else -1
                 page.translationX = dir * w
                 old.animate().translationX(-dir * w).setDuration(SLIDE_MS).setInterpolator(slideInterpolator)
                     .withEndAction { content.removeView(old) }.start()
@@ -406,9 +417,9 @@ class MainActivity : AppCompatActivity() {
         settlePages()
         dragDir = dir
         dragging = true
-        val target = selectedTab + dir
+        val target = tabOrder.getOrNull(posOf(selectedTab) + dir) ?: -1
         dragCurrentRefs = saveRefs()
-        if (target in tabNames.indices) {
+        if (target >= 0) {
             clearRefs()
             val neighbor: View = buildPage(target)
             dragNeighborRefs = saveRefs()
@@ -435,7 +446,7 @@ class MainActivity : AppCompatActivity() {
         val offset = if (dragDir > 0) dx.coerceIn(-w, 0f) else dx.coerceIn(0f, w)
         val flung = Math.abs(vx) > dp(600) && (vx < 0) == (dragDir > 0)
         val commit = neighbor != null && (Math.abs(offset) > w / 3f || flung)
-        val target = selectedTab + dragDir
+        val target = tabOrder.getOrNull(posOf(selectedTab) + dragDir) ?: -1
         val savedCurrent = dragCurrentRefs
         val savedNeighbor = dragNeighborRefs
         dragging = false; dragTracking = false
@@ -449,7 +460,6 @@ class MainActivity : AppCompatActivity() {
                 .withEndAction { content.removeView(page) }.start()
             neighbor.animate().translationX(0f).setDuration(duration).setInterpolator(slideInterpolator).start()
             currentPage = neighbor
-            recordMove(selectedTab, target)
             selectedTab = target
             savedNeighbor?.let { restoreRefs(it) }
             updateTabHighlight()
@@ -462,12 +472,55 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** Long-press a tab icon, then slide it along the bar to reorder; the order is saved on release. */
+    private fun enableTabReorder(item: View) {
+        var reordering = false
+        item.setOnLongClickListener {
+            reordering = true
+            it.parent.requestDisallowInterceptTouchEvent(true)
+            it.performHapticFeedback(android.view.HapticFeedbackConstants.LONG_PRESS)
+            it.animate().scaleX(1.12f).scaleY(1.12f).setDuration(120).start()
+            it.elevation = dp(8).toFloat()
+            true
+        }
+        item.setOnTouchListener { v, e ->
+            if (!reordering) return@setOnTouchListener false
+            when (e.actionMasked) {
+                MotionEvent.ACTION_MOVE -> {
+                    val loc = IntArray(2); tabsRow.getLocationOnScreen(loc)
+                    val x = e.rawX - loc[0]
+                    val cur = tabsRow.indexOfChild(v)
+                    var to = cur
+                    for (i in 0 until tabsRow.childCount) {
+                        val c = tabsRow.getChildAt(i)
+                        if (x >= c.left && x <= c.right) { to = i; break }
+                    }
+                    if (to != cur) {
+                        android.transition.TransitionManager.beginDelayedTransition(tabsRow)
+                        val lp = v.layoutParams
+                        tabsRow.removeViewAt(cur)
+                        tabsRow.addView(v, to, lp)
+                        tabOrder.add(to, tabOrder.removeAt(cur))
+                    }
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    reordering = false
+                    v.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
+                    v.elevation = 0f
+                    saveTabOrder()
+                    centerSelectedTab()
+                }
+            }
+            true
+        }
+    }
+
     private fun updateTabHighlight() {
         if (!::tabsRow.isInitialized) return
         android.transition.TransitionManager.beginDelayedTransition(tabsRow)
         for (i in 0 until tabsRow.childCount) {
             val view = tabsRow.getChildAt(i) as LinearLayout
-            val active = i == selectedTab
+            val active = view.tag == selectedTab
             val tint = color(if (active) R.color.md_on_secondary_container else R.color.md_on_surface_variant)
             view.background = if (active) ui.pillBg(R.color.md_secondary_container, 200) else null
             view.setPadding(if (active) dp(14) else 0, 0, if (active) dp(16) else 0, 0)
@@ -481,8 +534,8 @@ class MainActivity : AppCompatActivity() {
 
     /** Scrolls the pill nav bar so the selected tab sits in the middle, not just into view. */
     private fun centerSelectedTab() {
-        if (!::navScroll.isInitialized || selectedTab >= tabsRow.childCount) return
-        val item = tabsRow.getChildAt(selectedTab)
+        if (!::navScroll.isInitialized) return
+        val item = tabsRow.getChildAt(posOf(selectedTab)) ?: return
         navScroll.postDelayed({
             val target = item.left + item.width / 2 - navScroll.width / 2
             navScroll.smoothScrollTo(target.coerceAtLeast(0), 0)
