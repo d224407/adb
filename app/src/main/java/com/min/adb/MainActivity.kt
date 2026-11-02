@@ -237,7 +237,7 @@ class MainActivity : AppCompatActivity() {
             isFocusable = true
             isClickable = true
             contentDescription = "Sideload APK"
-            setOnClickListener { openSideloadChooser() }
+            setOnClickListener { if (selectedTab == TAB_FILES) openFilesMenu() else openSideloadChooser() }
         }.withPressAnimation()
         frame.addView(fab, FrameLayout.LayoutParams(dp(56), dp(56)).apply {
             gravity = Gravity.BOTTOM or Gravity.END
@@ -467,8 +467,8 @@ class MainActivity : AppCompatActivity() {
             (view.getChildAt(0) as ImageView).imageTintList = android.content.res.ColorStateList.valueOf(tint)
             (view.getChildAt(1) as TextView).apply { visibility = if (active) View.VISIBLE else View.GONE; setTextColor(tint) }
         }
-        // The sideload "+" belongs to Packages only.
-        fabView?.visibility = if (selectedTab == TAB_PACKAGES) View.VISIBLE else View.GONE
+        // The "+" belongs to Packages (sideload) and Files (add).
+        fabView?.visibility = if (selectedTab == TAB_PACKAGES || selectedTab == TAB_FILES) View.VISIBLE else View.GONE
         centerSelectedTab()
     }
 
@@ -1439,27 +1439,18 @@ class MainActivity : AppCompatActivity() {
 
     // ─────────────────────────────────── File manager / ADB SYNC ───────────────────────────────────
     private fun buildFilesTab(root: LinearLayout) {
-        title(root, "Files")
-        paragraph(root, "Browse and transfer files over ADB SYNC.")
-        val path = edit(root, "Path on the device", "/sdcard", InputType.TYPE_CLASS_TEXT)
+        val path = edit(root, "Path on the device", "/sdcard", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI)
         filePathEdit = path
         val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val output = outputView(root, "Tap List to open a directory")
-        root.removeView(output) // keep original order: buttons, list, output
+        val output = outputView(root, "")
+        root.removeView(output)
         // Page views are captured here (not read from fields later) so a slow reply can't land on another tab.
         lateinit var reloadFn: (String) -> Unit
-        reloadFn = { p -> listRemoteFiles(p) { entries -> renderFileEntries(entries, list, output, path, reloadFn) } }
+        reloadFn = { p -> listRemoteFiles(p) { r -> renderFileEntries(r, list, output, path, reloadFn) } }
         val reload = reloadFn
         filesReload = reload
-        row(root, listOf(
-            "List" to { reload(path.text.toString()) },
-            "Up to parent" to { path.setText(parentPath(path.text.toString())); reload(path.text.toString()) },
-            "New folder" to { askText("New folder name") { name -> runCommand("mkdir -p ${shellQuote(joinRemote(path.text.toString(), name))}") { toast("Folder created"); reload(path.text.toString()) } } }
-        ))
-        row(root, listOf(
-            "Push file to TV" to { pendingPushPath = path.text.toString().trim().ifBlank { "/sdcard" }; pickLocalFile() },
-            "Pull path from TV" to { askText("File path on the TV") { remote -> pendingPullPath = remote; createLocalFile(remote) } }
-        ))
+        path.imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_GO
+        path.setOnEditorActionListener { _, _, _ -> reload(path.text.toString()); true }
         root.addView(list, matchWrap())
         root.addView(output, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
         fileListContainer = list
@@ -1467,21 +1458,77 @@ class MainActivity : AppCompatActivity() {
         reload(path.text.toString())
     }
 
-    private fun listRemoteFiles(path: String, done: ((List<String>) -> Unit)? = null) {
-        val safe = path.trim().ifBlank { "/sdcard" }
-        runShell("ls -1Ap ${shellQuote(safe)}") { raw ->
-            val entries = raw.lineSequence().map { it.trimEnd('\r') }.filter { it.isNotBlank() && it != "Permission denied" && !it.startsWith("ls: ") }.toList()
-            done?.invoke(entries)
+    /** "+" menu of the Files tab (same style as the sideload chooser). */
+    private fun openFilesMenu() {
+        val edit = filePathEdit
+        val reload = filesReload
+        if (adb == null || edit == null || reload == null) { toast("Failed: connect to a device first", error = true); return }
+        val dir = edit.text.toString().trim().ifBlank { "/sdcard" }
+        AlertDialog.Builder(this).setTitle("Add to $dir")
+            .setItems(arrayOf("New folder", "New file", "Send a file from this phone")) { _, which ->
+                when (which) {
+                    0 -> askText("New folder name") { name -> runCommand("mkdir -p ${shellQuote(joinRemote(dir, name))}") { toast("Folder created"); reload(dir) } }
+                    1 -> askText("New file name") { name -> runCommand("touch ${shellQuote(joinRemote(dir, name))}") { toast("File created"); reload(dir) } }
+                    else -> { pendingPushPath = dir; pickLocalFile() }
+                }
+            }.setNegativeButton("Cancel", null).show()
+    }
+
+    private class FileListing(val entries: List<String>, val empty: Set<String>, val error: String?)
+
+    private fun listRemoteFiles(path: String, done: (FileListing) -> Unit) {
+        val connection = adb
+        if (connection == null) { done(FileListing(emptyList(), emptySet(), "Not connected")); return }
+        val dir = path.trim().ifBlank { "/sdcard" }.let { if (it.endsWith("/")) it else "$it/" } // trailing "/" so symlinks like /sdcard are followed
+        thread(name = "adb-list") {
+            val result = try {
+                val raw = connection.shell(
+                    "d=${shellQuote(dir)}; ls -1ApL \"\$d\" 2>&1; echo __EMPTY__; " +
+                    "cd \"\$d\" 2>/dev/null && for x in */; do [ -d \"\$x\" ] && [ -z \"\$(ls -A \"\$x\" 2>&1)\" ] && echo \"\$x\"; done"
+                )
+                val parts = raw.replace("\r", "").split("__EMPTY__\n", limit = 2)
+                val lines = parts[0].lines().filter { it.isNotBlank() }
+                val errors = lines.filter { it.startsWith("ls: ") }
+                val entries = lines.filter { !it.startsWith("ls: ") }
+                val empty = parts.getOrNull(1)?.lines()?.filter { it.isNotBlank() }?.toSet().orEmpty()
+                FileListing(entries, empty, errors.firstOrNull()?.removePrefix("ls: ")?.takeIf { entries.isEmpty() })
+            } catch (e: Exception) { FileListing(emptyList(), emptySet(), e.message ?: e.javaClass.simpleName) }
+            runOnUiThread { done(result) }
         }
     }
 
-    private fun renderFileEntries(entries: List<String>, list: LinearLayout, output: TextView, path: EditText, reload: (String) -> Unit) {
+    private fun fileIcon(name: String, isDir: Boolean, isEmpty: Boolean): Int {
+        if (isDir) return if (isEmpty) R.drawable.ic_folder_empty else R.drawable.ic_folder
+        return when (name.substringAfterLast('.', "").lowercase()) {
+            "apk" -> R.drawable.ic_apk
+            "jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif", "svg" -> R.drawable.ic_image
+            "mp4", "mkv", "avi", "mov", "webm", "3gp", "ts", "m4v" -> R.drawable.ic_video
+            "mp3", "wav", "flac", "ogg", "m4a", "aac", "opus" -> R.drawable.ic_audio
+            "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "apks", "apkm", "xapk" -> R.drawable.ic_archive
+            "txt", "log", "md", "json", "xml", "csv", "pdf", "doc", "docx", "html", "sh", "conf", "ini", "prop", "yml", "yaml" -> R.drawable.ic_doc
+            else -> R.drawable.ic_file
+        }
+    }
+
+    private fun renderFileEntries(listing: FileListing, list: LinearLayout, output: TextView, path: EditText, reload: (String) -> Unit) {
         list.removeAllViews()
-        output.text = if (entries.isEmpty()) "Empty directory or no read permission." else "${entries.size} items in ${path.text}"
-        val rows = entries.map { entry ->
+        val entries = listing.entries
+        output.text = when {
+            listing.error != null -> listing.error
+            entries.isEmpty() -> "Empty folder"
+            else -> "${entries.size} items"
+        }
+        if (entries.isEmpty()) return
+        val sorted = entries.sortedWith(compareByDescending<String> { it.endsWith("/") }.thenBy { it.lowercase() })
+        val rows = sorted.map { entry ->
             val isDir = entry.endsWith("/")
             val name = entry.removeSuffix("/")
-            ui.Row(entry, onClick = {
+            val icon = ImageView(this).apply {
+                setImageResource(fileIcon(name, isDir, entry in listing.empty))
+                scaleType = ImageView.ScaleType.FIT_CENTER
+                imageTintList = android.content.res.ColorStateList.valueOf(color(if (isDir) R.color.md_primary else R.color.md_on_surface_variant))
+            }
+            ui.Row(name, leading = icon, onClick = {
                 val full = joinRemote(path.text.toString(), name)
                 if (isDir) { path.setText(full); reload(full) }
                 else showFileActions(full, output) { reload(path.text.toString()) }

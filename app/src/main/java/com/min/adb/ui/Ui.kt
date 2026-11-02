@@ -100,7 +100,8 @@ class Ui(val ctx: Context) {
         desc: String? = null,
         trailing: View? = null,
         trailingExpands: Boolean = false,
-        onClick: (() -> Unit)? = null
+        onClick: (() -> Unit)? = null,
+        leading: View? = null
     ) : LinearLayout(ctx) {
         val nameView = label(name, 16.5f, R.color.md_on_surface, bold = true)
         val descView = label(desc ?: "", 14f, R.color.md_on_surface_variant).apply {
@@ -116,6 +117,7 @@ class Ui(val ctx: Context) {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(18), dp(14), dp(18), dp(14))
             minimumHeight = dp(56)
+            if (leading != null) addView(leading, LayoutParams(dp(26), dp(26)).apply { marginEnd = dp(14) })
             val info = LinearLayout(ctx).apply {
                 orientation = VERTICAL
                 addView(nameView)
