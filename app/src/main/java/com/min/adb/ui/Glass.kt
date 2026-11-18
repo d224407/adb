@@ -444,7 +444,7 @@ class GlassTabBar(
     private val inset = dp(4)
     private val pressedScale = 64f / 56f
     private val dark = isDarkTheme(context)
-    private val container = if (dark) 0x66121212 else 0x66FAFAFA
+    private var container = (0x44 shl 24) or (if (dark) 0x121212 else 0xFAFAFA)
     private val indicator = GlassView(context, backdrop, backdropColor)
     private val tabs = ArrayList<LinearLayout>()
     private val scroll = HorizontalScrollView(context)
@@ -523,6 +523,15 @@ class GlassTabBar(
         })
         paintTabs()
         applyState()
+    }
+
+    /** Sets the bar and capsule fill alpha (0-255). */
+    fun setTintAlpha(alpha: Int) {
+        container = (alpha shl 24) or (if (dark) 0x121212 else 0xFAFAFA)
+        tint = container
+        indicator.tint = container
+        indicator.commit()
+        commit()
     }
 
     private fun paintTabs() {

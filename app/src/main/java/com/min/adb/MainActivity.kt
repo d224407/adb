@@ -104,8 +104,8 @@ class MainActivity : AppCompatActivity() {
     private var pendingPushPath: String? = null
     private var pendingPullPath: String? = null
 
-    private val tabNames = listOf("Packages", "Terminal", "Commands", "Processes", "Logcat", "Remote", "Screen", "Files")
-    private val tabIcons = listOf(R.drawable.ic_packages, R.drawable.ic_commands, R.drawable.ic_bolt, R.drawable.ic_processes, R.drawable.ic_logcat, R.drawable.ic_remote, R.drawable.ic_screen, R.drawable.ic_files)
+    private val tabNames = listOf("Packages", "Terminal", "Commands", "Processes", "Logcat", "Remote", "Screen", "Files", "Settings")
+    private val tabIcons = listOf(R.drawable.ic_packages, R.drawable.ic_commands, R.drawable.ic_bolt, R.drawable.ic_processes, R.drawable.ic_logcat, R.drawable.ic_remote, R.drawable.ic_screen, R.drawable.ic_files, R.drawable.ic_settings)
 
     object KeyEvent {
         const val UP = 19; const val DOWN = 20; const val LEFT = 21; const val RIGHT = 22
@@ -196,6 +196,7 @@ class MainActivity : AppCompatActivity() {
         val backdrop = { page as View? }
         tabBar = GlassTabBar(this, backdrop, surface, tabNames, tabIcons) { renderTab(it) }
         glassViews.add(tabBar)
+        tabBar.setTintAlpha(glassAlpha())
         val screenW = resources.displayMetrics.widthPixels
         frame.addView(tabBar, FrameLayout.LayoutParams(tabBar.fitWidth(screenW - dp(24)), dp(64)).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
@@ -209,7 +210,7 @@ class MainActivity : AppCompatActivity() {
             blur = dp(8).toFloat()
             lensHeight = dp(16).toFloat()
             lensAmount = dp(16).toFloat()
-            tint = (0x99 shl 24) or (color(R.color.md_primary_container) and 0xFFFFFF)
+            tint = (glassAlpha(0x33) shl 24) or (color(R.color.md_primary_container) and 0xFFFFFF)
             elevation = dp(8).toFloat()
             isFocusable = true
             isClickable = true
@@ -236,6 +237,16 @@ class MainActivity : AppCompatActivity() {
         })
         updateTabHighlight(false)
         updateConnectionChip()
+    }
+
+    /** Glass fill alpha from the Settings level (0 clear, 1 normal, 2 frosted); [extra] for colored fills. */
+    private fun glassAlpha(extra: Int = 0): Int =
+        (when (prefs.getInt(PREF_GLASS, 1)) { 0 -> 0x30; 2 -> 0x66; else -> 0x44 } + extra).coerceAtMost(0xFF)
+
+    private fun applyGlassLevel() {
+        tabBar.setTintAlpha(glassAlpha())
+        fabView?.let { (it as GlassView).tint = (glassAlpha(0x33) shl 24) or (color(R.color.md_primary_container) and 0xFFFFFF) }
+        for (g in glassViews) g.commit()
     }
 
     private fun refreshGlass() { for (g in glassViews) g.invalidate() }
@@ -278,6 +289,7 @@ class MainActivity : AppCompatActivity() {
             TAB_COMMANDS -> buildCommandsTab(body)
             TAB_REMOTE -> buildRemoteTab(body)
             TAB_FILES -> buildFilesTab(body)
+            TAB_SETTINGS -> buildSettingsTab(body)
         }
         return scroll
     }
@@ -779,6 +791,44 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    // ─────────────────────────────────── Settings ───────────────────────────────────
+    private fun buildSettingsTab(root: LinearLayout) {
+        title(root, "Settings")
+
+        fun segmented(key: String, default: Int, options: List<String>, onChange: () -> Unit): LinearLayout {
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            val chips = ArrayList<TextView>()
+            options.forEachIndexed { i, text ->
+                val chip = ui.filterChip(text) {
+                    prefs.edit().putInt(key, i).apply()
+                    chips.forEachIndexed { j, c -> with(ui) { c.setSelectedChip(j == i, false) } }
+                    onChange()
+                }
+                chips.add(chip)
+                row.addView(chip, LinearLayout.LayoutParams(-2, -2).apply { marginEnd = dp(8) })
+            }
+            val cur = prefs.getInt(key, default)
+            chips.forEachIndexed { j, c -> with(ui) { c.setSelectedChip(j == cur, false) } }
+            return row
+        }
+
+        root.addView(ui.listTitle("Icon source"), matchWrap())
+        root.addView(segmented(PREF_ICON_METHOD, ICON_HELPER, listOf("Helper stub", "Pull APK")) { },
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8); bottomMargin = dp(16) })
+
+        root.addView(ui.listTitle("Glass"), matchWrap())
+        root.addView(segmented(PREF_GLASS, 1, listOf("Clear", "Normal", "Frosted")) { applyGlassLevel() },
+            LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8); bottomMargin = dp(16) })
+
+        root.addView(ui.actionRow(
+            ui.iconPill(R.drawable.ic_delete, "Clear icon cache") {
+                resetIconPrefetchState()
+                runCatching { File(cacheDir, "pkg_icons").deleteRecursively() }
+                toast("Icon cache cleared")
+            }.withPressAnimation()
+        ), matchWrap())
+    }
+
     // ─────────────────────────────────── Packages ───────────────────────────────────
     private fun buildPackagesTab(root: LinearLayout) {
         title(root, "Packages")
@@ -843,6 +893,10 @@ class MainActivity : AppCompatActivity() {
         // Fast path: one on-device helper app dumps every icon+label into small PNGs, we tar
         // and pull that single file. Anything it couldn't resolve (or if it fails entirely)
         // falls back to the slower per-app "pull the APK" path so icons still show either way.
+        if (prefs.getInt(PREF_ICON_METHOD, ICON_HELPER) == ICON_APK) {
+            for ((pkg, viewPair) in views) loadPackageInfo(pkg, viewPair.first, viewPair.second)
+            return
+        }
         bulkFetchIcons { bulk ->
             for ((pkg, viewPair) in views) {
                 val (nameView, icon) = viewPair
@@ -1946,8 +2000,8 @@ class MainActivity : AppCompatActivity() {
             blur = dp(8).toFloat()
             lensHeight = dp(12).toFloat()
             lensAmount = dp(14).toFloat()
-            tint = if (error) (0x99 shl 24) or (color(R.color.md_error_container) and 0xFFFFFF)
-            else if (isDarkTheme(context)) 0x66121212 else 0x66FAFAFA
+            tint = if (error) (glassAlpha(0x33) shl 24) or (color(R.color.md_error_container) and 0xFFFFFF)
+            else (glassAlpha() shl 24) or (if (isDarkTheme(context)) 0x121212 else 0xFAFAFA)
             elevation = dp(10).toFloat()
             isClickable = true
             setOnClickListener { dismissToast() }
@@ -2076,6 +2130,10 @@ class MainActivity : AppCompatActivity() {
         private const val SLIDE_MS = 260L
         // Tab indices, matching the order in `tabNames` above.
         private const val PROCESS_LIMIT = 400
+        private const val PREF_GLASS = "glass_level"
+        private const val PREF_ICON_METHOD = "icon_method"
+        private const val ICON_HELPER = 0
+        private const val ICON_APK = 1
         private const val TAB_PACKAGES = 0
         private const val TAB_TERMINAL = 1
         private const val TAB_COMMANDS = 2
@@ -2084,6 +2142,7 @@ class MainActivity : AppCompatActivity() {
         private const val TAB_REMOTE = 5
         private const val TAB_SCREEN = 6
         private const val TAB_FILES = 7
+        private const val TAB_SETTINGS = 8
 
         private const val PREF_LAST_HOST = "last_host_5555"
         private const val RC_MARK = "__ADB_RC__"
