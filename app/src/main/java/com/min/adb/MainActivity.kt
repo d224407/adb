@@ -23,18 +23,23 @@ import android.view.ViewGroup
 import android.view.animation.PathInterpolator
 import android.widget.EditText
 import android.widget.FrameLayout
-import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
 import com.min.adb.adb.AdbConnection
 import com.min.adb.adb.AdbCrypto
 import com.min.adb.adb.AdbSyncClient
 import com.min.adb.adb.transport.TcpTransport
 import com.min.adb.adb.transport.UsbTransport
+import com.min.adb.ui.BackdropLayout
+import com.min.adb.ui.GlassTabBar
+import com.min.adb.ui.GlassView
 import com.min.adb.ui.Ui
+import com.min.adb.ui.isDarkTheme
 import java.io.File
 import java.io.FileOutputStream
 import java.io.FileInputStream
@@ -53,15 +58,16 @@ import kotlin.concurrent.thread
 class MainActivity : AppCompatActivity() {
     private var lastStatus = ""
     private lateinit var rootFrame: FrameLayout
-    private var toastView: TextView? = null
+    private var toastView: View? = null
     private val toastHide = Runnable { dismissToast() }
     private lateinit var ipChip: TextView
     private lateinit var content: FrameLayout
-    private lateinit var tabsRow: LinearLayout
-    private lateinit var navScroll: HorizontalScrollView
+    private lateinit var tabBar: GlassTabBar
+    private lateinit var backdropPage: BackdropLayout
+    private val glassViews = ArrayList<GlassView>()
     private lateinit var crypto: AdbCrypto
     private val ui by lazy { Ui(this) }
-    private var adb: AdbConnection? = null
+    @Volatile private var adb: AdbConnection? = null
     private var selectedTab = TAB_PACKAGES
     private var lastBackAt = 0L
     private var filesReload: ((String) -> Unit)? = null
@@ -88,6 +94,7 @@ class MainActivity : AppCompatActivity() {
     private var packageRawUser = ""
     private var packageRawSystem = ""
     private var processRaw = ""
+    private var processIsPs = true
     private var filePathEdit: EditText? = null
     private var fileListContainer: LinearLayout? = null
     private var fileOutput: TextView? = null
@@ -97,9 +104,8 @@ class MainActivity : AppCompatActivity() {
     private var pendingPushPath: String? = null
     private var pendingPullPath: String? = null
 
-    // Tab order: Packages, Processes, Commands, Remote (D-pad), Screen, Files.
-    private val tabNames = listOf("Packages", "Terminal", "Commands", "Processes", "Remote", "Screen", "Files")
-    private val tabIcons = listOf(R.drawable.ic_packages, R.drawable.ic_commands, R.drawable.ic_bolt, R.drawable.ic_processes, R.drawable.ic_remote, R.drawable.ic_screen, R.drawable.ic_files)
+    private val tabNames = listOf("Packages", "Terminal", "Commands", "Processes", "Logcat", "Remote", "Screen", "Files")
+    private val tabIcons = listOf(R.drawable.ic_packages, R.drawable.ic_commands, R.drawable.ic_bolt, R.drawable.ic_processes, R.drawable.ic_logcat, R.drawable.ic_remote, R.drawable.ic_screen, R.drawable.ic_files)
 
     object KeyEvent {
         const val UP = 19; const val DOWN = 20; const val LEFT = 21; const val RIGHT = 22
@@ -147,15 +153,13 @@ class MainActivity : AppCompatActivity() {
     private val prefs by lazy { getSharedPreferences("adb_prefs", MODE_PRIVATE) }
 
     private fun buildShellUi() {
-        // Outer frame: scrollable content behind a floating pill nav bar, same layering as
-        // #pages + .nav-bar in style.css (nav bar pinned to the bottom, not pushing content).
+        // Page content sits behind the floating glass tab bar and button.
         val frame = FrameLayout(this).apply { setBackgroundColor(color(R.color.md_surface)) }
         rootFrame = frame
 
-        val page = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val page = BackdropLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        // Persistent top bar, shown above every tab: connected device IP (blank if none) +
-        // a small Connect button next to it. Both open the same connect/scan/pair dialog.
+        // Top bar: connected IP and a Connect button; both open the connect dialog.
         val topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -184,73 +188,57 @@ class MainActivity : AppCompatActivity() {
         page.addView(topBar, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT))
         page.addView(content, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        // .nav-bar: a floating pill, centered, sitting above the content near the bottom.
-        navScroll = HorizontalScrollView(this).apply {
-            isHorizontalScrollBarEnabled = false
-            background = ui.pillBg(R.color.md_surface_container_high, 200)
-            elevation = dp(6).toFloat()
-        }
-        tabsRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(6), dp(6), dp(6), dp(6))
-        }
-        navScroll.addView(tabsRow)
-        tabNames.indices.forEach { id ->
-            val label = tabNames[id]
-            val item = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER
-                minimumWidth = dp(56)
-                contentDescription = label
-                tag = id
-                isClickable = true; isFocusable = true
-                setOnClickListener { renderTab(id) }
-                addView(ImageView(context).apply {
-                    setImageResource(tabIcons[id]); scaleType = ImageView.ScaleType.CENTER
-                }, LinearLayout.LayoutParams(dp(24), dp(24)))
-                addView(TextView(context).apply {
-                    text = label; textSize = 13f; maxLines = 1; visibility = View.GONE
-                    setPadding(dp(6), 0, 0, 0)
-                }, LinearLayout.LayoutParams(-2, -2))
-            }
-            tabsRow.addView(item, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(44)).apply { marginEnd = dp(2) })
-        }
+        backdropPage = page
+        frame.clipChildren = false
         frame.addView(page, FrameLayout.LayoutParams(-1, -1))
-        frame.addView(
-            navScroll,
-            FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-                bottomMargin = dp(16)
-            }
-        )
-        // Rounded-square "+" (sideload APK), floating just above the bottom pill nav bar.
-        val fabRadius = dp(18).toFloat()
-        val fab = TextView(this).apply {
+
+        val surface = color(R.color.md_surface)
+        val backdrop = { page as View? }
+        tabBar = GlassTabBar(this, backdrop, surface, tabNames, tabIcons) { renderTab(it) }
+        glassViews.add(tabBar)
+        val screenW = resources.displayMetrics.widthPixels
+        frame.addView(tabBar, FrameLayout.LayoutParams(tabBar.fitWidth(screenW - dp(24)), dp(64)).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            bottomMargin = dp(16)
+        })
+
+        // Round "+" button (sideload / add file) above the tab bar.
+        val fab = GlassView(this, backdrop, surface).apply {
             fabView = this
-            text = "+"
-            textSize = 30f
-            gravity = Gravity.CENTER
-            includeFontPadding = false
-            setTextColor(color(R.color.md_on_primary_container))
-            background = ui.stateBg(R.color.md_primary_container, FloatArray(8) { fabRadius })
-            elevation = dp(6).toFloat()
+            radius = dp(18).toFloat()
+            blur = dp(8).toFloat()
+            lensHeight = dp(16).toFloat()
+            lensAmount = dp(16).toFloat()
+            tint = (0x99 shl 24) or (color(R.color.md_primary_container) and 0xFFFFFF)
+            elevation = dp(8).toFloat()
             isFocusable = true
             isClickable = true
             contentDescription = "Sideload APK"
             setOnClickListener { if (selectedTab == TAB_FILES) openFilesMenu() else openSideloadChooser() }
+            addView(TextView(context).apply {
+                text = "+"
+                textSize = 30f
+                gravity = Gravity.CENTER
+                includeFontPadding = false
+                setTextColor(color(R.color.md_on_primary_container))
+            }, FrameLayout.LayoutParams(-1, -1))
         }.withPressAnimation()
+        glassViews.add(fab)
         frame.addView(fab, FrameLayout.LayoutParams(dp(56), dp(56)).apply {
             gravity = Gravity.BOTTOM or Gravity.END
-            bottomMargin = dp(16 + 56 + 12)
+            bottomMargin = dp(16 + 64 + 12)
             marginEnd = dp(16)
         })
+        page.onChanged = { refreshGlass() }
         setContentView(frame)
         onBackPressedDispatcher.addCallback(this, object : androidx.activity.OnBackPressedCallback(true) {
             override fun handleOnBackPressed() = handleBack()
         })
-        updateTabHighlight()
+        updateTabHighlight(false)
         updateConnectionChip()
     }
+
+    private fun refreshGlass() { for (g in glassViews) g.invalidate() }
 
     private fun updateConnectionChip() {
         if (!::ipChip.isInitialized) return
@@ -275,11 +263,12 @@ class MainActivity : AppCompatActivity() {
     /** Builds one tab's page. Leaves that page's view refs in the member fields. */
     private fun buildPage(index: Int): View {
         if (index == TAB_TERMINAL) return buildTerminalPage()
+        if (index == TAB_LOGCAT) return buildLogcatPage()
         if (index == TAB_SCREEN) return buildScreenPage()
         val scroll = ScrollView(this)
         val body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            // Extra bottom padding so content can scroll clear of the floating pill nav bar.
+            // Bottom padding keeps content clear of the floating bar.
             setPadding(dp(16), dp(14), dp(16), dp(170))
         }
         scroll.addView(body)
@@ -290,15 +279,10 @@ class MainActivity : AppCompatActivity() {
             TAB_REMOTE -> buildRemoteTab(body)
             TAB_FILES -> buildFilesTab(body)
         }
-        // Content eases in, a little later for each item.
-        for (i in 0 until body.childCount) body.getChildAt(i).apply {
-            alpha = 0f; translationY = dp(16).toFloat()
-            animate().alpha(1f).translationY(0f).setStartDelay(minOf(i, 10) * 25L).setDuration(220).start()
-        }
         return scroll
     }
 
-    /** Drops every page except the current one and stops any running slide. */
+    /** Drops every page except the current one and stops any running animation. */
     private fun settlePages() {
         for (i in content.childCount - 1 downTo 0) {
             val v = content.getChildAt(i)
@@ -318,10 +302,10 @@ class MainActivity : AppCompatActivity() {
         val page = buildPage(index)
         content.addView(page)
         currentPage = page
+        val w = content.width.toFloat()
         if (old != null) {
-            val w = content.width.toFloat()
+            // Slide only on a real tab change; a refresh of the same tab swaps instantly.
             if (index != previous && w > 0f) {
-                // Same slide for every tab: one page width, fixed duration.
                 val dir = if (index > previous) 1 else -1
                 page.translationX = dir * w
                 old.animate().translationX(-dir * w).setDuration(SLIDE_MS).setInterpolator(slideInterpolator)
@@ -329,6 +313,7 @@ class MainActivity : AppCompatActivity() {
                 page.animate().translationX(0f).setDuration(SLIDE_MS).setInterpolator(slideInterpolator).start()
             } else content.removeView(old)
         }
+        refreshGlass()
     }
 
     // ---- Finger-following swipe between neighbouring tabs ----
@@ -353,13 +338,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-        if (!::navScroll.isInitialized || !::content.isInitialized) return super.dispatchTouchEvent(ev)
+        if (!::tabBar.isInitialized || !::content.isInitialized) return super.dispatchTouchEvent(ev)
         when (ev.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 val loc = IntArray(2)
                 content.getLocationOnScreen(loc)
                 val inContent = ev.rawY >= loc[1] && ev.rawY < loc[1] + content.height
-                val nav = IntArray(2); navScroll.getLocationOnScreen(nav)
+                val nav = IntArray(2); tabBar.getLocationOnScreen(nav)
                 dragTracking = inContent && ev.rawY < nav[1] && content.width > 0
                 dragging = false
                 dragStartX = ev.rawX; dragStartY = ev.rawY
@@ -420,6 +405,7 @@ class MainActivity : AppCompatActivity() {
         if (dragNeighbor == null) { page.translationX = raw * 0.25f; return } // edge: rubber band
         page.translationX = raw
         dragNeighbor!!.translationX = raw + dragDir * w
+        refreshGlass()
     }
 
     private fun endDrag(dx: Float, vx: Float) {
@@ -440,7 +426,7 @@ class MainActivity : AppCompatActivity() {
             val remaining = 1f - Math.abs(offset) / w
             val duration = (220f * remaining).toLong().coerceAtLeast(60L)
             page.animate().translationX(-dragDir * w).setDuration(duration).setInterpolator(slideInterpolator)
-                .withEndAction { content.removeView(page) }.start()
+                .setUpdateListener { refreshGlass() }.withEndAction { content.removeView(page) }.start()
             neighbor.animate().translationX(0f).setDuration(duration).setInterpolator(slideInterpolator).start()
             currentPage = neighbor
             selectedTab = target
@@ -448,38 +434,18 @@ class MainActivity : AppCompatActivity() {
             updateTabHighlight()
         } else {
             val duration = (220f * Math.abs(offset) / w).toLong().coerceAtLeast(60L)
-            page.animate().translationX(0f).setDuration(duration).setInterpolator(slideInterpolator).start()
+            page.animate().translationX(0f).setDuration(duration).setInterpolator(slideInterpolator)
+                .setUpdateListener { refreshGlass() }.start()
             neighbor?.animate()?.translationX(dragDir * w)?.setDuration(duration)?.setInterpolator(slideInterpolator)
                 ?.withEndAction { content.removeView(neighbor) }?.start()
             savedCurrent?.let { restoreRefs(it) }
         }
     }
 
-    private fun updateTabHighlight() {
-        if (!::tabsRow.isInitialized) return
-        android.transition.TransitionManager.beginDelayedTransition(tabsRow)
-        for (i in 0 until tabsRow.childCount) {
-            val view = tabsRow.getChildAt(i) as LinearLayout
-            val active = view.tag == selectedTab
-            val tint = color(if (active) R.color.md_on_secondary_container else R.color.md_on_surface_variant)
-            view.background = if (active) ui.pillBg(R.color.md_secondary_container, 200) else null
-            view.setPadding(if (active) dp(14) else 0, 0, if (active) dp(16) else 0, 0)
-            (view.getChildAt(0) as ImageView).imageTintList = android.content.res.ColorStateList.valueOf(tint)
-            (view.getChildAt(1) as TextView).apply { visibility = if (active) View.VISIBLE else View.GONE; setTextColor(tint) }
-        }
-        // The "+" belongs to Packages (sideload) and Files (add).
+    private fun updateTabHighlight(animate: Boolean = true) {
+        if (::tabBar.isInitialized) tabBar.select(selectedTab, animate)
+        // "+" belongs to Packages (sideload) and Files (add).
         fabView?.visibility = if (selectedTab == TAB_PACKAGES || selectedTab == TAB_FILES) View.VISIBLE else View.GONE
-        centerSelectedTab()
-    }
-
-    /** Scrolls the pill nav bar so the selected tab sits in the middle, not just into view. */
-    private fun centerSelectedTab() {
-        if (!::navScroll.isInitialized) return
-        val item = tabsRow.getChildAt(selectedTab) ?: return
-        navScroll.postDelayed({
-            val target = item.left + item.width / 2 - navScroll.width / 2
-            navScroll.smoothScrollTo(target.coerceAtLeast(0), 0)
-        }, 120)
     }
 
     // ─────────────────────────────────── Material tokens / helpers ───────────────────────────────────
@@ -498,7 +464,7 @@ class MainActivity : AppCompatActivity() {
                 val old = adb
                 old?.onClosed = null
                 adb = null
-                closeTerminal()
+                closeTerminal(); closeLogcat()
                 thread { runCatching { old?.close() }; runOnUiThread { updateConnectionChip(); setStatus("Disconnected") } }
             }, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8); bottomMargin = dp(8) })
             divider(container)
@@ -687,14 +653,14 @@ class MainActivity : AppCompatActivity() {
     /** Makes [connection] the active one and starts watching for it dropping. */
     private fun attachConnection(connection: AdbConnection) {
         adb?.let { it.onClosed = null; it.close() }
-        closeTerminal()
+        closeTerminal(); closeLogcat()
         adb = connection
         autoReconnect = true
         connection.onClosed = {
             runOnUiThread {
                 if (adb === connection) {
                     adb = null
-                    closeTerminal()
+                    closeTerminal(); closeLogcat()
                     updateConnectionChip(); setStatus("Disconnected")
                     scanForLastDevice()
                 }
@@ -715,7 +681,7 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     updateConnectionChip(); setStatus("Connected - $host:$port; fetching app icons...")
                     // Load packages (and icons) right away instead of waiting for a manual Refresh.
-                    if (selectedTab == TAB_PACKAGES || selectedTab == TAB_TERMINAL || selectedTab == TAB_SCREEN) renderTab(selectedTab)
+                    if (selectedTab == TAB_PACKAGES || selectedTab == TAB_TERMINAL || selectedTab == TAB_LOGCAT || selectedTab == TAB_SCREEN) renderTab(selectedTab)
                 }
                 prefetchIconsAfterConnect()
             } catch (e: Exception) {
@@ -733,7 +699,7 @@ class MainActivity : AppCompatActivity() {
         val device: UsbDevice? = manager.deviceList.values.firstOrNull { UsbTransport.findAdbInterface(it) != null }
         if (device == null) { toast("No USB device with an ADB interface found. Check the OTG cable and USB debugging."); return }
         if (!manager.hasPermission(device)) {
-            val pi = PendingIntent.getBroadcast(this, 0, Intent("com.min.adb.USB_PERMISSION"), PendingIntent.FLAG_MUTABLE)
+            val pi = PendingIntent.getBroadcast(this, 0, Intent("com.min.adb.USB_PERMISSION").setPackage(packageName), PendingIntent.FLAG_MUTABLE)
             manager.requestPermission(device, pi)
             toast("Grant the USB permission, then tap Connect via USB again")
             return
@@ -746,7 +712,7 @@ class MainActivity : AppCompatActivity() {
                 resetIconPrefetchState()
                 runOnUiThread {
                     updateConnectionChip(); setStatus("Connected over USB; fetching app icons...")
-                    if (selectedTab == TAB_PACKAGES || selectedTab == TAB_TERMINAL || selectedTab == TAB_SCREEN) renderTab(selectedTab)
+                    if (selectedTab == TAB_PACKAGES || selectedTab == TAB_TERMINAL || selectedTab == TAB_LOGCAT || selectedTab == TAB_SCREEN) renderTab(selectedTab)
                 }
                 prefetchIconsAfterConnect()
             } catch (e: Exception) { runOnUiThread { setStatus("USB connection failed: ${e.message}") } }
@@ -824,9 +790,10 @@ class MainActivity : AppCompatActivity() {
             )
         }
         root.addView(stateRow, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
+        lateinit var reload: () -> Unit
         root.addView(ui.actionRow(
             ui.iconPill(R.drawable.ic_system, if (packageShowSystem) "Hide system apps" else "Show system apps", primary = packageShowSystem) { packageShowSystem = !packageShowSystem; renderTab(TAB_PACKAGES) }.withPressAnimation(),
-            ui.iconPill(R.drawable.ic_refresh, "Refresh") { refreshPackages(root) }.withPressAnimation()
+            ui.iconPill(R.drawable.ic_refresh, "Refresh") { reload() }.withPressAnimation()
         ).apply { setPadding(0, dp(4), 0, 0) }, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
         val pf = edit(root, "Filter by package name", "", InputType.TYPE_CLASS_TEXT)
         packageFilter = pf
@@ -837,7 +804,8 @@ class MainActivity : AppCompatActivity() {
             list.removeAllViews()
             renderPackageRows(list, filter, result)
         })
-        refreshPackages(root) { list.removeAllViews(); renderPackageRows(list, pf.text?.toString().orEmpty(), result) }
+        reload = { refreshPackages(root) { list.removeAllViews(); renderPackageRows(list, pf.text?.toString().orEmpty(), result) } }
+        reload()
     }
 
     /** Fetches user (-3) and, if requested, system (-s) packages as two separate lists so
@@ -998,9 +966,7 @@ class MainActivity : AppCompatActivity() {
                     connection.shell("dumpsys package $HELPER_PKG | grep versionCode")
                 } else ""
                 val installedVersion = Regex("versionCode=(\\d+)").find(installedVersionLine)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-                // Version 2 adds QUERY_ALL_PACKAGES. Replace an older helper so an installation
-                // from a previous build cannot silently keep returning a filtered package list.
-                if (installedVersion < 3) {
+                if (installedVersion < BuildConfig.ICON_HELPER_VERSION) {
                     if (installedVersion > 0) connection.shell("pm uninstall $HELPER_PKG")
                     val apk = File(cacheDir, "iconhelper.apk")
                     assets.open("iconhelper.apk").use { input -> apk.outputStream().use { input.copyTo(it) } }
@@ -1021,12 +987,13 @@ class MainActivity : AppCompatActivity() {
                 var waited = 0
                 var completed = false
                 while (waited < 30_000) {
-                    val done = connection.shell("test -f $HELPER_REMOTE_DIR/DONE && echo DONE")
-                    if (done.contains("DONE")) { completed = true; break }
+                    val state = connection.shell("if [ -f $HELPER_REMOTE_DIR/DONE ]; then echo DONE; elif [ -f $HELPER_REMOTE_DIR/ERROR ]; then echo ERROR; cat $HELPER_REMOTE_DIR/ERROR; fi").trim()
+                    if (state.startsWith("DONE")) { completed = true; break }
+                    if (state.startsWith("ERROR")) throw IOException("icon helper failed: ${state.removePrefix("ERROR").trim()}")
                     Thread.sleep(400)
                     waited += 400
                 }
-                if (!completed) throw IOException("icon helper timed out (no DONE file)")
+                if (!completed) throw IOException("icon helper timed out")
 
                 // 3) Create one archive and pull it to the phone in a single ADB sync transfer.
                 val remoteTar = "/data/local/tmp/adb_icons.tar"
@@ -1040,9 +1007,9 @@ class MainActivity : AppCompatActivity() {
                 // 4) Decode the pulled PNGs and their labels into the in-memory icon cache.
                 val entries = untar(localTar)
                 localTar.delete()
-                val manifest = entries["manifest.csv"]?.toString(Charsets.UTF_8).orEmpty()
+                val manifest = entries["manifest.tsv"]?.toString(Charsets.UTF_8).orEmpty()
                 val labels = manifest.lineSequence().mapNotNull { line ->
-                    val idx = line.indexOf(',')
+                    val idx = line.indexOf('\t')
                     if (idx <= 0) null else line.substring(0, idx) to line.substring(idx + 1)
                 }.toMap()
                 for ((name, bytes) in entries) {
@@ -1055,7 +1022,7 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {
                 error = e.message ?: e.javaClass.simpleName
             }
-            finishIconFetch(result, error)
+            if (adb === connection) finishIconFetch(result, error)
         }
     }
 
@@ -1114,11 +1081,11 @@ class MainActivity : AppCompatActivity() {
         return out
     }
 
-    /** pm path -> pull the APK into cache -> getPackageArchiveInfo for the real icon + label.
-     *  Runs automatically for every row so icons/labels show by default; failures are silent
-     *  and just leave that row on its package-name fallback. */
+    private val apkPool = Executors.newFixedThreadPool(3)
+
+    /** Pull the APK into cache and read its icon + label; failures keep the package-name fallback. */
     private fun loadPackageInfo(pkg: String, nameView: TextView, icon: ImageView) {
-        thread(name = "adb-pull-apk") {
+        apkPool.execute {
             var cacheFile: File? = null
             try {
                 val connection = requireAdb()
@@ -1146,7 +1113,6 @@ class MainActivity : AppCompatActivity() {
                     if (drawable != null) icon.setImageDrawable(drawable)
                 }
             } catch (e: Exception) {
-                // Silent: row just keeps showing the package name with no icon.
             } finally {
                 cacheFile?.let { runCatching { it.delete() } }
             }
@@ -1260,39 +1226,159 @@ class MainActivity : AppCompatActivity() {
         return page
     }
 
+    // ─────────────────────────────────── Logcat ───────────────────────────────────
+    private var logcat: LogcatSession? = null
+    private var logcatFor: AdbConnection? = null
+    private var logPaused = false
+    private var logMinPriority = 0 // index into LogcatAdapter.PRIORITIES
+    private var logFilterText = ""
+    private var logFollow = true
+
+    private fun closeLogcat() { logcat?.stop(); logcat = null; logcatFor = null }
+
+    /** Starts logcat for the current connection when needed (new connection, or the old stream ended). */
+    private fun ensureLogcat(): LogcatSession? {
+        val c = adb ?: return null
+        val existing = logcat
+        if (existing != null && !existing.ended && logcatFor === c) return existing
+        closeLogcat()
+        return LogcatSession(c).also { it.start(); logcat = it; logcatFor = c }
+    }
+
+    private fun buildLogcatPage(): View {
+        val session = ensureLogcat()
+        val page = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(96))
+        }
+        val adapter = LogcatAdapter { e ->
+            val text = "${e.date} ${e.time} ${e.pid} ${e.tid} ${e.priority}/${e.tag}: ${e.msg}"
+            (getSystemService(CLIPBOARD_SERVICE) as android.content.ClipboardManager)
+                .setPrimaryClip(android.content.ClipData.newPlainText("log", text))
+            toast("Copied")
+        }
+        val count = ui.label(if (adb == null) "Not connected. Use the connect button at the top." else "", 13f, R.color.md_on_surface_variant)
+            .apply { setPadding(dp(4), 0, 0, dp(8)) }
+        val list = RecyclerView(this).apply {
+            layoutManager = LinearLayoutManager(context)
+            this.adapter = adapter
+            itemAnimator = null
+            overScrollMode = View.OVER_SCROLL_NEVER
+            background = ui.pillBg(R.color.md_surface_container_high, 16)
+            clipToOutline = true
+            addOnScrollListener(object : RecyclerView.OnScrollListener() {
+                override fun onScrollStateChanged(rv: RecyclerView, newState: Int) {
+                    if (newState == RecyclerView.SCROLL_STATE_IDLE) logFollow = !rv.canScrollVertically(1)
+                }
+            })
+        }
+
+        fun refresh() {
+            val s = session ?: return
+            val all = s.snapshot()
+            val q = logFilterText
+            val shown = all.filter { e ->
+                val level = LogcatAdapter.PRIORITIES.indexOf(e.priority).let { if (it < 0) Int.MAX_VALUE else it }
+                level >= logMinPriority && (q.isEmpty() || e.tag.contains(q, true) || e.msg.contains(q, true))
+            }
+            adapter.submit(shown)
+            count.text = "${shown.size} of ${all.size} lines" + if (s.ended) " · stream ended" else ""
+            if (logFollow && shown.isNotEmpty()) list.scrollToPosition(shown.size - 1)
+        }
+        val listener: () -> Unit = { if (!logPaused) refresh() }
+        page.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(v: View) { session?.listeners?.add(listener); refresh() }
+            override fun onViewDetachedFromWindow(v: View) { session?.listeners?.remove(listener) }
+        })
+
+        val filter = edit(page, "Filter by tag / message", logFilterText, InputType.TYPE_CLASS_TEXT)
+        filter.addTextChangedListener(SimpleTextWatcher { logFilterText = it.trim(); refresh() })
+
+        val chips = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val chipViews = ArrayList<TextView>()
+        fun paintChips() = chipViews.forEachIndexed { i, c -> with(ui) { c.setSelectedChip(i == logMinPriority, false) } }
+        LogcatAdapter.PRIORITIES.forEachIndexed { i, ch ->
+            val chip = ui.filterChip(ch.toString()) { logMinPriority = i; paintChips(); refresh() }.apply { gravity = Gravity.CENTER }
+            chipViews.add(chip)
+            chips.addView(chip, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { if (i > 0) marginStart = dp(6) })
+        }
+        paintChips()
+        page.addView(chips, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = dp(8) })
+
+        fun small(label: String, action: (TextView) -> Unit): TextView = ui.pill(label) { }.apply {
+            minHeight = dp(40); setPadding(dp(8), dp(6), dp(8), dp(6)); textSize = 14f
+            setOnClickListener { action(this) }
+        }
+        page.addView(ui.actionRow(
+            small(if (logPaused) "Resume" else "Pause") { b ->
+                logPaused = !logPaused
+                b.text = if (logPaused) "Resume" else "Pause"
+                if (!logPaused) refresh()
+            },
+            small("Clear") { session?.clear() ?: toast("Not connected", error = true); refresh() },
+            small("Bottom") { logFollow = true; if (adapter.itemCount > 0) list.scrollToPosition(adapter.itemCount - 1) }
+        ).apply { setPadding(0, 0, 0, dp(8)) }, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        page.addView(count, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT))
+        page.addView(list, LinearLayout.LayoutParams(-1, 0, 1f))
+        return page
+    }
+
+    private class ProcRow(val rss: Long, val text: String, val search: String)
+
     private fun buildProcessesTab(root: LinearLayout) {
         title(root, "Processes")
-        paragraph(root, "From ps -A. Columns vary by Android version.")
-        row(root, listOf("Refresh" to { refreshProcesses() }, "RAM info" to { runShell("cat /proc/meminfo") { processRaw = it; renderProcessOutput() } }))
-        processFilter = edit(root, "Filter by PID / user / process name", "", InputType.TYPE_CLASS_TEXT)
-        val out = outputView(root, "Tap Refresh to fetch the process list")
-        out.tag = "process-output"
-        processFilter?.addTextChangedListener(SimpleTextWatcher { renderProcessOutput(out) })
-        refreshProcesses { renderProcessOutput(out) }
-    }
-
-    private fun refreshProcesses(done: (() -> Unit)? = null) {
-        runShell("ps -A -o USER,PID,PPID,RSS,VSZ,STAT,NAME") { raw -> processRaw = raw; done?.invoke() ?: renderTab(TAB_PROCESSES) }
-    }
-
-    private fun renderProcessOutput(target: TextView? = null) {
-        val filterText = processFilter?.text?.toString() ?: ""
-        val filtered = processRaw.lineSequence().filter { line -> line.contains(filterText, ignoreCase = true) }.joinToString("\n")
-        (target ?: findOutputInContent())?.text = filtered.ifBlank { "No data yet. Refresh after connecting over ADB." }
-    }
-
-    private fun findOutputInContent(): TextView? {
-        fun search(v: View): TextView? {
-            if (v is TextView && v.tag == "process-output") return v
-            if (v is ViewGroup) {
-                for (i in 0 until v.childCount) {
-                    val found = search(v.getChildAt(i))
-                    if (found != null) return found
-                }
-            }
-            return null
+        val info = ui.label("", 13f, R.color.md_on_surface_variant).apply { setPadding(dp(4), 0, 0, dp(8)) }
+        val out = ui.label("Tap Refresh to fetch the process list", 12f, R.color.md_on_surface, mono = true).apply {
+            background = ui.pillBg(R.color.md_surface_container_high, 16)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
         }
-        return currentPage?.let { search(it) }
+        fun render() = renderProcessOutput(out, info)
+        row(root, listOf(
+            "Refresh" to { refreshProcesses { render() } },
+            "RAM info" to { runShell("cat /proc/meminfo") { processRaw = it; processIsPs = false; render() } }
+        ))
+        processFilter = edit(root, "Filter by PID / user / process name", "", InputType.TYPE_CLASS_TEXT)
+        processFilter?.addTextChangedListener(SimpleTextWatcher { render() })
+        root.addView(info, matchWrap())
+        root.addView(out, matchWrap())
+        if (processRaw.isNotBlank()) render()
+        refreshProcesses { render() }
+    }
+
+    private fun refreshProcesses(done: () -> Unit) {
+        runShell("ps -A -o USER,PID,PPID,RSS,VSZ,STAT,NAME") { raw -> processRaw = raw; processIsPs = true; done() }
+    }
+
+    /** Parses `ps` output (USER PID PPID RSS VSZ STAT NAME); null when the columns are not as expected. */
+    private fun parseProcesses(raw: String): List<ProcRow>? {
+        val lines = raw.lineSequence().filter { it.isNotBlank() }.toList()
+        val head = lines.firstOrNull()?.trim()?.split(Regex("\\s+")) ?: return null
+        if (head.firstOrNull() != "USER" || "PID" !in head) return null
+        val rows = lines.drop(1).mapNotNull { line ->
+            val p = line.trim().split(Regex("\\s+"), 7)
+            val rss = p.getOrNull(3)?.toLongOrNull()
+            if (p.size < 7 || rss == null) return@mapNotNull null
+            val mb = String.format(java.util.Locale.US, "%.1f", rss / 1024.0)
+            ProcRow(rss, "${p[6]}\n${p[0]} · PID ${p[1]} · PPID ${p[2]} · $mb MB · ${p[5]}", line)
+        }
+        return if (rows.isEmpty()) null else rows.sortedByDescending { it.rss }
+    }
+
+    private fun renderProcessOutput(out: TextView, info: TextView) {
+        val q = processFilter?.text?.toString()?.trim().orEmpty()
+        info.text = ""
+        if (processRaw.isBlank()) { out.text = "No data yet. Refresh after connecting over ADB."; return }
+        val rows = if (processIsPs) parseProcesses(processRaw) else null
+        if (rows == null) {
+            out.text = processRaw.lineSequence().filter { it.contains(q, ignoreCase = true) }.joinToString("\n")
+            return
+        }
+        val shown = rows.filter { q.isEmpty() || it.search.contains(q, ignoreCase = true) }
+        info.text = "${shown.size} of ${rows.size} processes, sorted by memory"
+        val more = shown.size - PROCESS_LIMIT
+        out.text = shown.take(PROCESS_LIMIT).joinToString("\n\n") { it.text } +
+            if (more > 0) "\n\n+$more more, narrow the filter" else ""
     }
 
     // ─────────────────────────────────── Screen mirror ───────────────────────────────────
@@ -1422,17 +1508,28 @@ class MainActivity : AppCompatActivity() {
 
     private fun takeScreenshot() {
         if (adb == null) { toast("Not connected", error = true); return }
-        runShell("screencap -p | base64") { raw ->
+        val c = adb ?: return
+        thread(name = "adb-shot") {
+            val remote = "/data/local/tmp/adb_shot.png"
             try {
-                val bytes = android.util.Base64.decode(raw.filterNot { it.isWhitespace() }, android.util.Base64.DEFAULT)
-                if (BitmapFactory.decodeByteArray(bytes, 0, bytes.size) == null) { toast("Could not decode the screenshot", error = true); return@runShell }
-                lastShot = bytes
-                val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-                    addCategory(Intent.CATEGORY_OPENABLE); type = "image/png"; putExtra(Intent.EXTRA_TITLE, "screen-${System.currentTimeMillis()}.png")
+                c.shell("screencap -p $remote")
+                val out = java.io.ByteArrayOutputStream()
+                AdbSyncClient(c).pull(remote, out)
+                val bytes = out.toByteArray()
+                if (BitmapFactory.decodeByteArray(bytes, 0, bytes.size) == null) throw IOException("could not decode the screenshot")
+                runOnUiThread {
+                    lastShot = bytes
+                    pendingScreenshot = bytes
+                    startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE); type = "image/png"
+                        putExtra(Intent.EXTRA_TITLE, "screen-${System.currentTimeMillis()}.png")
+                    }, REQUEST_SAVE_SCREEN)
                 }
-                pendingScreenshot = bytes
-                startActivityForResult(intent, REQUEST_SAVE_SCREEN)
-            } catch (e: Exception) { toast("Screenshot failed: ${e.message}", error = true) }
+            } catch (e: Exception) {
+                runOnUiThread { toast("Screenshot failed: ${e.message}", error = true) }
+            } finally {
+                runCatching { c.shell("rm -f $remote") }
+            }
         }
     }
     private var pendingScreenshot: ByteArray? = null
@@ -1840,31 +1937,37 @@ class MainActivity : AppCompatActivity() {
         toast(value)
     }
 
-    /** In-app toast pinned to the top of this Activity's own view tree (not android.widget.Toast),
-     *  so it disappears with the app: removed on pause/stop/destroy instead of lingering. */
+    /** Glass toast pinned to the top of this Activity's view tree; removed with the Activity. */
     private fun toast(value: String, error: Boolean = false, durationMs: Long = 0L) {
         if (!::rootFrame.isInitialized) return
         dismissToast()
-        val view = TextView(this).apply {
-            text = value
-            textSize = 14f
-            maxLines = 3
-            ellipsize = android.text.TextUtils.TruncateAt.END
-            setPadding(dp(18), dp(12), dp(18), dp(12))
-            setTextColor(color(if (error) R.color.md_on_error_container else R.color.md_on_secondary_container))
-            background = ui.pillBg(if (error) R.color.md_error_container else R.color.md_secondary_container, 20)
+        val glass = GlassView(this, { backdropPage as View? }, color(R.color.md_surface)).apply {
+            radius = dp(22).toFloat()
+            blur = dp(8).toFloat()
+            lensHeight = dp(12).toFloat()
+            lensAmount = dp(14).toFloat()
+            tint = if (error) (0x99 shl 24) or (color(R.color.md_error_container) and 0xFFFFFF)
+            else if (isDarkTheme(context)) 0x66121212 else 0x66FAFAFA
             elevation = dp(10).toFloat()
             isClickable = true
             setOnClickListener { dismissToast() }
             alpha = 0f
             translationY = -dp(16).toFloat()
+            addView(TextView(context).apply {
+                text = value
+                textSize = 14f
+                maxLines = 3
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                setPadding(dp(18), dp(12), dp(18), dp(12))
+                setTextColor(color(if (error) R.color.md_on_error_container else R.color.md_on_surface))
+            }, FrameLayout.LayoutParams(-2, -2))
         }
-        rootFrame.addView(view, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+        rootFrame.addView(glass, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
             topMargin = dp(16); marginStart = dp(16); marginEnd = dp(16)
         })
-        view.animate().alpha(1f).translationY(0f).setDuration(180).start()
-        toastView = view
+        glass.animate().alpha(1f).translationY(0f).setDuration(180).start()
+        toastView = glass
         handler.postDelayed(toastHide, if (durationMs > 0) durationMs else if (error) 3500 else 2500)
     }
 
@@ -1963,22 +2066,24 @@ class MainActivity : AppCompatActivity() {
         dismissToast()
         handler.removeCallbacksAndMessages(null)
         autoReconnect = false
-        closeTerminal()
+        closeTerminal(); closeLogcat()
         val old = adb
         old?.onClosed = null
         thread { runCatching { old?.close() } }
     }
 
     companion object {
-        // Tab indices, matching the order in `tabNames` above.
-        private const val TAB_PACKAGES = 0
         private const val SLIDE_MS = 260L
+        // Tab indices, matching the order in `tabNames` above.
+        private const val PROCESS_LIMIT = 400
+        private const val TAB_PACKAGES = 0
         private const val TAB_TERMINAL = 1
         private const val TAB_COMMANDS = 2
         private const val TAB_PROCESSES = 3
-        private const val TAB_REMOTE = 4
-        private const val TAB_SCREEN = 5
-        private const val TAB_FILES = 6
+        private const val TAB_LOGCAT = 4
+        private const val TAB_REMOTE = 5
+        private const val TAB_SCREEN = 6
+        private const val TAB_FILES = 7
 
         private const val PREF_LAST_HOST = "last_host_5555"
         private const val RC_MARK = "__ADB_RC__"

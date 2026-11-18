@@ -1,6 +1,9 @@
 package com.min.adb.adb
 
 import java.io.IOException
+import java.nio.ByteBuffer
+import java.nio.CharBuffer
+import java.nio.charset.CodingErrorAction
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
@@ -45,12 +48,31 @@ class AdbStream(
 
     fun readAllText(timeoutMs: Long = 10_000): String {
         val sb = StringBuilder()
+        val decoder = Utf8StreamDecoder()
         while (true) {
             val chunk = read(timeoutMs) ?: break
-            sb.append(String(chunk, Charsets.UTF_8))
+            sb.append(decoder.decode(chunk))
         }
         return sb.toString()
     }
 
     fun close() { connection.sendClose(this) }
+}
+
+/** UTF-8 decoder that keeps a multi-byte character split across two chunks intact. */
+class Utf8StreamDecoder {
+    private val decoder = Charsets.UTF_8.newDecoder()
+        .onMalformedInput(CodingErrorAction.REPLACE).onUnmappableCharacter(CodingErrorAction.REPLACE)
+    private var carry = ByteArray(0)
+
+    fun decode(chunk: ByteArray): String {
+        val bytes = carry + chunk
+        val input = ByteBuffer.wrap(bytes)
+        val out = CharBuffer.allocate(bytes.size + 1)
+        decoder.reset()
+        decoder.decode(input, out, false)
+        out.flip()
+        carry = ByteArray(input.remaining()).also { input.get(it) }
+        return out.toString()
+    }
 }

@@ -3,6 +3,8 @@ plugins {
     alias(libs.plugins.kotlin.android)
 }
 
+val helperVersion = providers.gradleProperty("iconHelperVersion").get().toInt()
+
 android {
     namespace = "com.min.adb.iconhelper"
     compileSdk = 34
@@ -10,12 +12,10 @@ android {
     defaultConfig {
         applicationId = "com.min.adb.iconhelper"
         minSdk = 21
-        // Deliberately staying on the legacy (pre-scoped) storage model so writing to /sdcard
-        // just needs the normal WRITE_EXTERNAL_STORAGE permission, granted silently via
-        // `pm grant`/install-time grant - no runtime permission dialog ever appears on the TV.
+        // Old targetSdk keeps the install silent: no runtime permission dialog on the device.
         targetSdk = 28
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = helperVersion
+        versionName = "1.$helperVersion"
     }
 
     compileOptions {
@@ -32,8 +32,6 @@ android {
         }
         release {
             isMinifyEnabled = false
-            // No keystore needed for this internal helper - it's never published, only pushed
-            // and installed by the main app itself.
             signingConfig = signingConfigs.getByName("debug")
         }
     }

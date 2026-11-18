@@ -5,15 +5,15 @@ plugins {
     alias(libs.plugins.kotlin.android)
 }
 
-// So the copyIconHelperApk task below can read :iconhelper's configured output directory.
 evaluationDependsOn(":iconhelper")
 
-// --- Release signing: read from keystore.properties if present (git-ignored) ------------------
+// Release signing comes from keystore.properties (git-ignored).
 val keystoreProps = Properties().apply {
     val f = rootProject.file("keystore.properties")
     if (f.exists()) f.inputStream().use { load(it) }
 }
 val hasReleaseKeystore = keystoreProps.getProperty("storeFile") != null
+val iconHelperVersion = providers.gradleProperty("iconHelperVersion").get().toInt()
 
 android {
     namespace = "com.min.adb"
@@ -25,6 +25,8 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0.0"
+        // Same number as :iconhelper's versionCode; the app reinstalls an older helper.
+        buildConfigField("int", "ICON_HELPER_VERSION", "$iconHelperVersion")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild {
             cmake { arguments += listOf("-DANDROID_STL=c++_static") }
@@ -40,8 +42,6 @@ android {
     }
 
     buildFeatures {
-        // Toàn bộ UI giờ dựng bằng code (xem MainActivity.kt) — không còn layout XML nào
-        // để ViewBinding sinh class, nên tắt đi cho gọn.
         buildConfig = true
         prefab = true
     }
@@ -67,7 +67,7 @@ android {
 
     buildTypes {
         // ------------------------------------------------------------------ DEBUG
-        // De go loi nhat: khong minify, log day du, cai song song ban release (duoi .debug).
+        // No minify; installs next to release (.debug suffix).
         debug {
             isDebuggable = true
             isMinifyEnabled = false
@@ -87,8 +87,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // Co keystore.properties thi ky bang key that; khong co thi ky tam bang debug key
-            // de van cai thu duoc (KHONG dung ban nay de phat hanh).
+            // Without keystore.properties the debug key signs it: installable, not for release.
             signingConfig = if (hasReleaseKeystore) signingConfigs.getByName("release")
             else signingConfigs.getByName("debug")
         }
@@ -106,8 +105,7 @@ android {
     packaging {
         resources.excludes += setOf(
             "/META-INF/{AL2.0,LGPL2.1}",
-            // BouncyCastle + Conscrypt ship multi-release/OSGi metadata that collides on merge
-            // (e.g. META-INF/versions/9/OSGI-INF/MANIFEST.MF); none of it is used on Android.
+            // BouncyCastle/Conscrypt metadata collides on merge and is unused on Android.
             "/META-INF/versions/**",
             "/META-INF/MANIFEST.MF",
             "/META-INF/INDEX.LIST",
@@ -136,11 +134,7 @@ dependencies {
     testImplementation(libs.junit)
 }
 
-// ------------------------------------------------------------------------------------------
-// Bundle the headless :iconhelper APK as a raw asset so MainActivity can push + `pm install`
-// it onto the TV on demand (see bulkFetchIcons in MainActivity.kt). Rebuilding :iconhelper's
-// debug APK and copying it into app/src/main/assets runs automatically before every build.
-// ------------------------------------------------------------------------------------------
+// Bundles the :iconhelper debug APK as an asset (pushed and installed by bulkFetchIcons).
 val copyIconHelperApk by tasks.registering(Copy::class) {
     dependsOn(":iconhelper:assembleDebug")
     from(project(":iconhelper").layout.buildDirectory.dir("outputs/apk/debug")) {
