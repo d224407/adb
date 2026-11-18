@@ -1,6 +1,5 @@
 package com.min.adb.ui
 
-import android.animation.ValueAnimator
 import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Canvas
@@ -18,18 +17,21 @@ import android.graphics.RenderNode
 import android.graphics.RuntimeShader
 import android.graphics.Shader
 import android.os.Build
+import android.view.Choreographer
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.ViewOutlineProvider
 import android.view.ViewTreeObserver
-import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.annotation.RequiresApi
+import kotlin.math.abs
+import kotlin.math.sqrt
 import androidx.core.content.ContextCompat
 import androidx.core.widget.TextViewCompat
 import com.min.adb.R
@@ -399,7 +401,32 @@ open class GlassView(
     }
 }
 
-/** Bottom tab bar made of glass: a scrolling row of tabs and a glass capsule that slides under the selected one. */
+
+/** Critically/under-damped spring stepped manually (mass 1). */
+private class Spring(private val zeta: Float, private val k: Float, var value: Float, private val eps: Float) {
+    var target = value
+    var vel = 0f
+    val active get() = abs(value - target) > eps || abs(vel) > eps * 10f
+
+    fun snap(v: Float) { value = v; target = v; vel = 0f }
+
+    fun step(dt: Float) {
+        val c = 2f * zeta * sqrt(k)
+        var left = dt
+        while (left > 0f) {
+            val h = minOf(left, 1f / 240f)
+            vel += (-k * (value - target) - c * vel) * h
+            value += vel * h
+            left -= h
+        }
+        if (!active) { value = target; vel = 0f }
+    }
+}
+
+/**
+ * Bottom tab bar made of glass (port of Kyant's LiquidBottomTabs): a capsule that can be pressed and dragged,
+ * grows with a lens while pressed, squishes with velocity, and the bar bulges and shifts with the drag.
+ */
 class GlassTabBar(
     context: Context,
     backdrop: () -> View?,
@@ -414,13 +441,27 @@ class GlassTabBar(
 
     private val tabW = dp(64)
     private val tabH = dp(56)
+    private val inset = dp(4)
+    private val pressedScale = 64f / 56f
     private val dark = isDarkTheme(context)
     private val container = if (dark) 0x66121212 else 0x66FAFAFA
     private val indicator = GlassView(context, backdrop, backdropColor)
     private val tabs = ArrayList<LinearLayout>()
     private val scroll = HorizontalScrollView(context)
     private var selected = 0
-    private var press: ValueAnimator? = null
+
+    private val pos = Spring(1f, 1000f, 0f, 0.001f)
+    private val press = Spring(1f, 1000f, 0f, 0.001f)
+    private val scaleXs = Spring(0.6f, 250f, 1f, 0.001f)
+    private val scaleYs = Spring(0.7f, 250f, 1f, 0.001f)
+    private val velocity = Spring(0.5f, 300f, 0f, 0.001f)
+    private val offset = Spring(0.5f, 300f, 0f, 0.5f)
+    private var releasing = false
+    private var dragging = false
+    private var lastX = 0f
+    private var lastPos = 0f
+    private var running = false
+    private var lastNanos = 0L
 
     /** Width that fits all tabs, capped to [maxWidth]. */
     fun fitWidth(maxWidth: Int): Int = minOf(tabW * tabs.size + dp(8), maxWidth)
@@ -436,12 +477,11 @@ class GlassTabBar(
         indicator.apply {
             blur = dp(8).toFloat()
             tint = container
-            overlay = if (dark) 0x1AFFFFFF else 0x1A000000
             rim = 0f
         }
 
         val strip = FrameLayout(context)
-        strip.addView(indicator, FrameLayout.LayoutParams(tabW, tabH))
+        strip.addView(indicator, FrameLayout.LayoutParams(tabW, tabH).apply { topMargin = inset })
         val row = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
         names.forEachIndexed { i, name ->
             val tab = LinearLayout(context).apply {
@@ -450,7 +490,7 @@ class GlassTabBar(
                 contentDescription = name
                 isClickable = true
                 isFocusable = true
-                setOnClickListener { select(i, true); onSelect(i) }
+                setOnClickListener { if (i != selected) { select(i, true); onSelect(i) } }
                 addView(ImageView(context).apply {
                     setImageResource(icons[i])
                     scaleType = ImageView.ScaleType.CENTER
@@ -465,7 +505,7 @@ class GlassTabBar(
             tabs.add(tab)
             row.addView(tab, LinearLayout.LayoutParams(tabW, tabH))
         }
-        strip.addView(row, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, tabH))
+        strip.addView(row, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, tabH).apply { topMargin = inset })
 
         scroll.apply {
             isHorizontalScrollBarEnabled = false
@@ -478,10 +518,11 @@ class GlassTabBar(
             }
             addView(strip)
         }
-        addView(scroll, LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, tabH, Gravity.CENTER).apply {
-            marginStart = dp(4); marginEnd = dp(4)
+        addView(scroll, LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT).apply {
+            marginStart = inset; marginEnd = inset
         })
         paintTabs()
+        applyState()
     }
 
     private fun paintTabs() {
@@ -494,42 +535,145 @@ class GlassTabBar(
         }
     }
 
-    /** Moves the capsule to [index]; with [animate] it overshoots and the lens bulges briefly. */
+    /** Moves the capsule to [index]; with [animate] it springs there with the press effect. */
     fun select(index: Int, animate: Boolean) {
         if (index !in tabs.indices) return
-        val changed = index != selected
         selected = index
         paintTabs()
-        val target = (index * tabW).toFloat()
-        indicator.animate().cancel()
-        press?.cancel()
         if (!animate || !isLaidOut) {
-            indicator.translationX = target
-        } else if (changed) {
-            indicator.animate().translationX(target).setDuration(320).setInterpolator(OvershootInterpolator(0.9f)).start()
-            press = ValueAnimator.ofFloat(0f, 1f, 0f).apply {
-                duration = 420
-                addUpdateListener {
-                    val p = it.animatedValue as Float
-                    indicator.lensHeight = dp(10) * p
-                    indicator.lensAmount = dp(14) * p
-                    indicator.chromatic = true
-                    indicator.rim = p
-                    indicator.scaleX = 1f + 0.18f * p
-                    indicator.scaleY = 1f + 0.18f * p
-                    indicator.commit()
-                }
-                start()
+            pos.snap(index.toFloat())
+            applyState()
+        } else if (pos.target != index.toFloat()) {
+            pos.target = index.toFloat()
+            pressDown()
+            releasing = true
+            kick()
+        }
+        keepVisible(index.toFloat(), true)
+    }
+
+    private fun pressDown() {
+        press.target = 1f; scaleXs.target = pressedScale; scaleYs.target = pressedScale
+    }
+
+    private fun pressUp() {
+        press.target = 0f; scaleXs.target = 1f; scaleYs.target = 1f
+    }
+
+    private fun keepVisible(p: Float, smooth: Boolean) {
+        scroll.post {
+            val x = (p * tabW + tabW / 2 - scroll.width / 2).toInt().coerceAtLeast(0)
+            if (smooth) scroll.smoothScrollTo(x, 0) else scroll.scrollTo(x, 0)
+        }
+    }
+
+    // ---- Drag: only the capsule is draggable; the rest of the bar scrolls and taps normally ----
+    override fun onInterceptTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
+            val x = ev.x - scroll.left + scroll.scrollX
+            val left = pos.value * tabW
+            if (x >= left && x <= left + tabW) {
+                dragging = true
+                lastX = ev.x
+                return true
             }
         }
-        scroll.post {
-            val x = index * tabW + tabW / 2 - scroll.width / 2
-            scroll.smoothScrollTo(x.coerceAtLeast(0), 0)
+        return false
+    }
+
+    override fun onTouchEvent(ev: MotionEvent): Boolean {
+        if (!dragging) return super.onTouchEvent(ev)
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                parent?.requestDisallowInterceptTouchEvent(true)
+                releasing = false
+                pressDown()
+                kick()
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val dx = ev.x - lastX
+                lastX = ev.x
+                pos.target = (pos.target + dx / (tabW * scaleX)).coerceIn(0f, (tabs.size - 1).toFloat())
+                offset.snap(offset.value + dx)
+                // Keep the capsule inside the visible strip while dragging.
+                val x = pos.value * tabW
+                if (x < scroll.scrollX) scroll.scrollTo(x.toInt(), 0)
+                else if (x + tabW > scroll.scrollX + scroll.width) scroll.scrollTo((x + tabW - scroll.width).toInt(), 0)
+                kick()
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                dragging = false
+                val idx = Math.round(pos.target).coerceIn(0, tabs.size - 1)
+                pos.target = idx.toFloat()
+                offset.target = 0f
+                releasing = true
+                if (idx != selected) { selected = idx; paintTabs(); onSelect(idx) }
+                keepVisible(idx.toFloat(), true)
+                kick()
+            }
         }
+        return true
+    }
+
+    // ---- Spring loop ----
+    private val frame = object : Choreographer.FrameCallback {
+        override fun doFrame(nanos: Long) {
+            val dt = if (lastNanos == 0L) 1f / 60f else ((nanos - lastNanos) / 1e9f).coerceIn(0.001f, 0.05f)
+            lastNanos = nanos
+            lastPos = pos.value
+            pos.step(dt)
+            velocity.target = (pos.value - lastPos) / dt / (tabs.size - 1).coerceAtLeast(1)
+            velocity.step(dt)
+            press.step(dt); scaleXs.step(dt); scaleYs.step(dt); offset.step(dt)
+            if (releasing && abs(pos.value - pos.target) < (tabs.size - 1) * 0.025f) { releasing = false; pressUp() }
+            applyState()
+            if (pos.active || press.active || scaleXs.active || scaleYs.active || velocity.active || offset.active || releasing || dragging) {
+                Choreographer.getInstance().postFrameCallback(this)
+            } else {
+                running = false
+                lastNanos = 0L
+            }
+        }
+    }
+
+    private fun kick() {
+        if (running) return
+        running = true
+        lastNanos = 0L
+        Choreographer.getInstance().postFrameCallback(frame)
+    }
+
+    override fun onDetachedFromWindow() {
+        Choreographer.getInstance().removeFrameCallback(frame)
+        running = false
+        super.onDetachedFromWindow()
+    }
+
+    private fun applyState() {
+        val p = press.value.coerceIn(0f, 1f)
+        val w = width.toFloat().takeIf { it > 0f } ?: (tabW * tabs.size).toFloat()
+        // Bar: shifts a few dp with the drag and bulges while pressed.
+        val f = (offset.value / w).coerceIn(-1f, 1f)
+        translationX = dp(4) * Math.signum(f) * (1f - (1f - abs(f)) * (1f - abs(f)))
+        val barScale = 1f + dp(16) / w * p
+        scaleX = barScale; scaleY = barScale
+
+        indicator.translationX = pos.value * tabW
+        val v = velocity.value / 10f
+        indicator.scaleX = scaleXs.value / (1f - (v * 0.75f).coerceIn(-0.2f, 0.2f))
+        indicator.scaleY = scaleYs.value * (1f - (v * 0.25f).coerceIn(-0.2f, 0.2f))
+        indicator.lensHeight = dp(10) * p
+        indicator.lensAmount = dp(14) * p
+        indicator.chromatic = p > 0.01f
+        indicator.rim = p
+        val base = if (dark) 0xFFFFFF else 0x000000
+        indicator.overlay = (((0x1A * (1f - p)).toInt()) shl 24) or base
+        indicator.commit()
+        commit()
     }
 
     override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
         super.onLayout(changed, l, t, r, b)
-        if (changed && indicator.translationX == 0f && selected != 0) indicator.translationX = (selected * tabW).toFloat()
+        if (changed && !running) { pos.snap(selected.toFloat()); applyState(); keepVisible(selected.toFloat(), false) }
     }
 }
