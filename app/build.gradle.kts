@@ -14,7 +14,7 @@ val keystoreProps = Properties().apply {
 }
 val hasReleaseKeystore = keystoreProps.getProperty("storeFile") != null
 // Only place the app version lives; Release Please rewrites the annotated line.
-val appVersion = "1.0.0" // x-release-please-version
+val appVersion = "1.1.0" // x-release-please-version
 val iconHelperVersion = providers.gradleProperty("iconHelperVersion").get().toInt()
 
 android {
