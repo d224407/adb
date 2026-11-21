@@ -44,14 +44,16 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.FileInputStream
 import java.io.IOException
-import java.io.RandomAccessFile
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.Socket
+import java.util.UUID
+import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.zip.ZipInputStream
 import kotlin.concurrent.thread
 
 /** ADB utility with persistent bottom tabs. All remote commands require a user-authorized ADB connection. */
@@ -824,6 +826,7 @@ class MainActivity : AppCompatActivity() {
             ui.iconPill(R.drawable.ic_delete, "Clear icon cache") {
                 resetIconPrefetchState()
                 runCatching { File(cacheDir, "pkg_icons").deleteRecursively() }
+                runCatching { File(cacheDir, "icon_cache").deleteRecursively() }
                 toast("Icon cache cleared")
             }.withPressAnimation()
         ), matchWrap())
@@ -988,10 +991,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** Installs (once) a tiny headless helper app on the TV that reads every icon/label straight
-     *  from its own on-device PackageManager - no per-app APK pulls needed. It writes small PNGs
-     *  plus a manifest.csv, we tar them into ONE file on-device and pull just that, which is far
-     *  faster than pulling one full APK per installed app. Falls back silently (empty map) to let
-     *  the caller use the old per-app pull for whatever this couldn't resolve. */
+     *  from its own on-device PackageManager - no per-app APK pulls needed. The helper renders
+     *  only apps whose sha256 fingerprint changed, packs them as WebP into ONE zip (all cores),
+     *  and we pull just that. Unchanged icons come from the on-disk cache. On failure the cache
+     *  is returned, so the caller falls back to the per-app pull only for what is missing. */
     private fun bulkFetchIcons(onResult: (Map<String, Pair<String?, Bitmap?>>) -> Unit) {
         synchronized(bulkIconCache) {
             if (iconsPrefetched) {
@@ -1012,14 +1015,13 @@ class MainActivity : AppCompatActivity() {
         thread(name = "adb-bulk-icons") {
             val result = HashMap<String, Pair<String?, Bitmap?>>()
             var error: String? = null
+            val iconDir = File(cacheDir, "icon_cache").apply { mkdirs() }
+            val index = readIconIndex(iconDir)
             try {
                 // 1) Ensure the helper is installed. The APK is bundled by copyIconHelperApk
                 // during the normal Gradle preBuild task.
-                val pathCheck = connection.shell("pm path $HELPER_PKG")
-                val installedVersionLine = if (pathCheck.contains("package:")) {
-                    connection.shell("dumpsys package $HELPER_PKG | grep versionCode")
-                } else ""
-                val installedVersion = Regex("versionCode=(\\d+)").find(installedVersionLine)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                val versionLine = connection.shell("dumpsys package $HELPER_PKG | grep versionCode")
+                val installedVersion = Regex("versionCode=(\\d+)").find(versionLine)?.groupValues?.get(1)?.toIntOrNull() ?: 0
                 if (installedVersion < BuildConfig.ICON_HELPER_VERSION) {
                     if (installedVersion > 0) connection.shell("pm uninstall $HELPER_PKG")
                     val apk = File(cacheDir, "iconhelper.apk")
@@ -1030,11 +1032,14 @@ class MainActivity : AppCompatActivity() {
                     if (!install.contains("Success", ignoreCase = true)) throw IOException("helper install failed: $install")
                 }
 
-                // 2) Clear stale files, explicitly target the receiver, and wait for DONE.
-                // Fresh folder name per run, so a leftover DONE from an earlier run can't be mistaken for this one.
+                // 2) Fresh folder name per run, so a leftover DONE from an earlier run can't be mistaken
+                // for this one. The token proves our disk cache matches the helper's last run; only then
+                // does the helper skip apps whose sha256 fingerprint is unchanged.
                 val runDir = "icons_${System.currentTimeMillis()}"
                 val HELPER_REMOTE_DIR = "$HELPER_DATA_DIR/$runDir"
-                val broadcast = connection.shell("am broadcast -n $HELPER_PKG/.DumpReceiver -a $HELPER_ACTION --es dir $runDir")
+                val next = UUID.randomUUID().toString().replace("-", "").take(16)
+                val tokenArg = if (index.token.isNotEmpty()) " --es token ${index.token}" else ""
+                val broadcast = connection.shell("am broadcast -n $HELPER_PKG/.DumpReceiver -a $HELPER_ACTION --es dir $runDir --es next $next$tokenArg")
                 if (broadcast.contains("Error", ignoreCase = true) || broadcast.contains("not found", ignoreCase = true)) {
                     throw IOException("could not start icon helper: $broadcast")
                 }
@@ -1044,39 +1049,103 @@ class MainActivity : AppCompatActivity() {
                     val state = connection.shell("if [ -f $HELPER_REMOTE_DIR/DONE ]; then echo DONE; elif [ -f $HELPER_REMOTE_DIR/ERROR ]; then echo ERROR; cat $HELPER_REMOTE_DIR/ERROR; fi").trim()
                     if (state.startsWith("DONE")) { completed = true; break }
                     if (state.startsWith("ERROR")) throw IOException("icon helper failed: ${state.removePrefix("ERROR").trim()}")
-                    Thread.sleep(400)
-                    waited += 400
+                    Thread.sleep(150)
+                    waited += 150
                 }
                 if (!completed) throw IOException("icon helper timed out")
 
-                // 3) Create one archive and pull it to the phone in a single ADB sync transfer.
-                val remoteTar = "/data/local/tmp/adb_icons.tar"
-                val tarResult = connection.shell("tar -cf $remoteTar -C $HELPER_REMOTE_DIR .")
-                val tarCheck = connection.shell("test -s $remoteTar && echo TAR_OK")
-                if (!tarCheck.contains("TAR_OK")) throw IOException("could not create icon archive: $tarResult")
-                val localTar = File(cacheDir, "adb_icons.tar")
-                FileOutputStream(localTar).use { out -> AdbSyncClient(connection).pull(remoteTar, out) }
-                connection.shell("rm -rf $HELPER_REMOTE_DIR $remoteTar")
+                // 3) The helper already wrote ONE zip; pull it in a single ADB sync transfer.
+                val remoteZip = "/data/local/tmp/adb_icons.zip"
+                val copy = connection.shell("cp $HELPER_REMOTE_DIR/icons.zip $remoteZip && test -s $remoteZip && echo ZIP_OK")
+                if (!copy.contains("ZIP_OK")) throw IOException("could not stage icon archive: $copy")
+                val localZip = File(cacheDir, "adb_icons.zip")
+                FileOutputStream(localZip).use { out -> AdbSyncClient(connection).pull(remoteZip, out) }
+                connection.shell("rm -rf $HELPER_REMOTE_DIR $remoteZip")
 
-                // 4) Decode the pulled PNGs and their labels into the in-memory icon cache.
-                val entries = untar(localTar)
-                localTar.delete()
-                val manifest = entries["manifest.tsv"]?.toString(Charsets.UTF_8).orEmpty()
-                val labels = manifest.lineSequence().mapNotNull { line ->
-                    val idx = line.indexOf('\t')
-                    if (idx <= 0) null else line.substring(0, idx) to line.substring(idx + 1)
-                }.toMap()
-                for ((name, bytes) in entries) {
-                    if (!name.endsWith(".png")) continue
-                    val pkg = name.removeSuffix(".png")
-                    val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: continue
-                    result[pkg] = labels[pkg] to bmp
+                // 4) Read changed icons + the full manifest (every installed package, label only if changed).
+                val fresh = HashMap<String, ByteArray>()
+                var manifest = ""
+                ZipInputStream(localZip.inputStream().buffered()).use { zin ->
+                    while (true) {
+                        val entry = zin.nextEntry ?: break
+                        val bytes = zin.readBytes()
+                        if (entry.name == "manifest.tsv") manifest = bytes.toString(Charsets.UTF_8)
+                        else if (entry.name.endsWith(".webp")) fresh[entry.name.removeSuffix(".webp")] = bytes
+                    }
                 }
+                localZip.delete()
+                val labels = LinkedHashMap<String, String>()
+                for (line in manifest.lineSequence()) {
+                    val p = line.split('\t', limit = 3)
+                    if (p.size == 3 && p[0].isNotEmpty()) labels[p[0]] = p[2].ifBlank { index.labels[p[0]].orEmpty() }
+                }
+                if (labels.isEmpty()) throw IOException("helper completed but returned no icons")
+
+                // 5) Decode on all cores: new icons from the zip, unchanged ones from the disk cache.
+                val decoded = parallelMap(labels.keys.toList()) { pkg ->
+                    val bytes = fresh[pkg] ?: runCatching { File(iconDir, "$pkg.webp").readBytes() }.getOrNull()
+                    pkg to bytes?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
+                }
+                var complete = true
+                for ((pkg, bmp) in decoded) {
+                    if (bmp == null) { complete = false; continue }
+                    result[pkg] = labels[pkg]?.takeIf { it.isNotBlank() } to bmp
+                }
+
+                // 6) Persist. If anything is missing locally, drop the token so the next run is a full dump.
+                for ((pkg, bytes) in fresh) runCatching { File(iconDir, "$pkg.webp").writeBytes(bytes) }
+                iconDir.listFiles()?.forEach { f ->
+                    if (f.name.endsWith(".webp") && f.name.removeSuffix(".webp") !in labels) f.delete()
+                }
+                writeIconIndex(iconDir, if (complete) next else "", labels)
                 if (result.isEmpty()) throw IOException("helper completed but returned no icons")
             } catch (e: Exception) {
                 error = e.message ?: e.javaClass.simpleName
+                if (result.isEmpty()) result.putAll(loadIconsFromDisk(iconDir, index))
             }
             if (adb === connection) finishIconFetch(result, error)
+        }
+    }
+
+    /** Last successful helper run: token the helper must echo back, plus package -> label. */
+    private class IconIndex(val token: String, val labels: Map<String, String>)
+
+    private fun readIconIndex(dir: File): IconIndex {
+        val lines = runCatching { File(dir, "index.tsv").readLines() }.getOrNull() ?: return IconIndex("", emptyMap())
+        val labels = HashMap<String, String>()
+        for (line in lines.drop(1)) {
+            val i = line.indexOf('\t')
+            if (i > 0) labels[line.substring(0, i)] = line.substring(i + 1)
+        }
+        return IconIndex(lines.firstOrNull().orEmpty(), labels)
+    }
+
+    private fun writeIconIndex(dir: File, token: String, labels: Map<String, String>) {
+        val sb = StringBuilder(token).append('\n')
+        for ((pkg, label) in labels) sb.append(pkg).append('\t').append(label).append('\n')
+        val tmp = File(dir, "index.tmp")
+        tmp.writeText(sb.toString())
+        val dst = File(dir, "index.tsv")
+        dst.delete()
+        tmp.renameTo(dst)
+    }
+
+    private fun loadIconsFromDisk(dir: File, index: IconIndex): Map<String, Pair<String?, Bitmap?>> {
+        val out = HashMap<String, Pair<String?, Bitmap?>>()
+        val decoded = parallelMap(index.labels.keys.toList()) { pkg ->
+            pkg to runCatching { BitmapFactory.decodeFile(File(dir, "$pkg.webp").absolutePath) }.getOrNull()
+        }
+        for ((pkg, bmp) in decoded) if (bmp != null) out[pkg] = index.labels[pkg]?.takeIf { it.isNotBlank() } to bmp
+        return out
+    }
+
+    /** Runs [fn] over [items] on every core and returns results in input order. */
+    private fun <T, R> parallelMap(items: List<T>, fn: (T) -> R): List<R> {
+        val pool = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors().coerceAtLeast(2))
+        try {
+            return items.map { item -> pool.submit(Callable { fn(item) }) }.map { it.get() }
+        } finally {
+            pool.shutdown()
         }
     }
 
@@ -1108,31 +1177,6 @@ class MainActivity : AppCompatActivity() {
                 setStatus("ADB connected, but icon prefetch failed$detail. Open Packages to retry.")
             }
         }
-    }
-
-    /** Minimal reader for the flat POSIX ustar files Android's toybox `tar` produces here - just
-     *  enough to read back the file set written by the helper app (no subdirectories). */
-    private fun untar(file: File): Map<String, ByteArray> {
-        val out = HashMap<String, ByteArray>()
-        RandomAccessFile(file, "r").use { raf ->
-            val header = ByteArray(512)
-            while (raf.read(header) == 512) {
-                if (header.all { it == 0.toByte() }) break
-                val name = String(header, 0, 100, Charsets.US_ASCII).trim('\u0000', ' ')
-                val sizeOctal = String(header, 124, 12, Charsets.US_ASCII).trim('\u0000', ' ')
-                val size = if (sizeOctal.isBlank()) 0L else sizeOctal.toLong(8)
-                if (name.isNotBlank() && !name.endsWith("/")) {
-                    val data = ByteArray(size.toInt())
-                    raf.readFully(data)
-                    out[name.substringAfterLast('/')] = data
-                } else {
-                    raf.skipBytes(size.toInt())
-                }
-                val padding = ((512 - (size % 512)) % 512).toInt()
-                raf.skipBytes(padding)
-            }
-        }
-        return out
     }
 
     private val apkPool = Executors.newFixedThreadPool(3)

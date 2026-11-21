@@ -13,6 +13,8 @@ val keystoreProps = Properties().apply {
     if (f.exists()) f.inputStream().use { load(it) }
 }
 val hasReleaseKeystore = keystoreProps.getProperty("storeFile") != null
+// Only place the app version lives; Release Please rewrites the annotated line.
+val appVersion = "1.0.0" // x-release-please-version
 val iconHelperVersion = providers.gradleProperty("iconHelperVersion").get().toInt()
 
 android {
@@ -23,8 +25,8 @@ android {
         applicationId = "com.min.adb"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = appVersion.split(".").let { it[0].toInt() * 10000 + it[1].toInt() * 100 + it[2].toInt() }
+        versionName = appVersion
         // Same number as :iconhelper's versionCode; the app reinstalls an older helper.
         buildConfigField("int", "ICON_HELPER_VERSION", "$iconHelperVersion")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
