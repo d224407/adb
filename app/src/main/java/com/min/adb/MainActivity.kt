@@ -260,14 +260,16 @@ class MainActivity : AppCompatActivity() {
 
     private class PageRefs(
         val filePathEdit: EditText?, val fileListContainer: LinearLayout?, val fileOutput: TextView?,
-        val packageFilter: EditText?, val processFilter: EditText?
+        val packageFilter: EditText?, val processFilter: EditText?,
+        val terminalView: TextView?, val terminalScroll: ScrollView?
     )
-    private fun saveRefs() = PageRefs(filePathEdit, fileListContainer, fileOutput, packageFilter, processFilter)
+    private fun saveRefs() = PageRefs(filePathEdit, fileListContainer, fileOutput, packageFilter, processFilter, terminalView, terminalScroll)
     private fun restoreRefs(r: PageRefs) {
         filePathEdit = r.filePathEdit; fileListContainer = r.fileListContainer; fileOutput = r.fileOutput
         packageFilter = r.packageFilter; processFilter = r.processFilter
+        terminalView = r.terminalView; terminalScroll = r.terminalScroll
     }
-    private fun clearRefs() { filePathEdit = null; fileListContainer = null; fileOutput = null; packageFilter = null; processFilter = null }
+    private fun clearRefs() { filePathEdit = null; fileListContainer = null; fileOutput = null; packageFilter = null; processFilter = null; terminalView = null; terminalScroll = null }
 
     private var currentPage: View? = null
     private var fabView: View? = null
@@ -992,7 +994,7 @@ class MainActivity : AppCompatActivity() {
 
     /** Installs (once) a tiny headless helper app on the TV that reads every icon/label straight
      *  from its own on-device PackageManager - no per-app APK pulls needed. The helper renders
-     *  only apps whose sha256 fingerprint changed, packs them as WebP into ONE zip (all cores),
+     *  only apps whose fingerprint (version + update time + APK size) changed, packs them as WebP into ONE zip (all cores),
      *  and we pull just that. Unchanged icons come from the on-disk cache. On failure the cache
      *  is returned, so the caller falls back to the per-app pull only for what is missing. */
     private fun bulkFetchIcons(onResult: (Map<String, Pair<String?, Bitmap?>>) -> Unit) {
@@ -1034,7 +1036,7 @@ class MainActivity : AppCompatActivity() {
 
                 // 2) Fresh folder name per run, so a leftover DONE from an earlier run can't be mistaken
                 // for this one. The token proves our disk cache matches the helper's last run; only then
-                // does the helper skip apps whose sha256 fingerprint is unchanged.
+                // does the helper skip apps whose fingerprint is unchanged.
                 val runDir = "icons_${System.currentTimeMillis()}"
                 val HELPER_REMOTE_DIR = "$HELPER_DATA_DIR/$runDir"
                 val next = UUID.randomUUID().toString().replace("-", "").take(16)
@@ -1240,12 +1242,22 @@ class MainActivity : AppCompatActivity() {
     private var terminalFor: AdbConnection? = null
     private var terminalView: TextView? = null
     private var terminalScroll: ScrollView? = null
+    private var terminalShown = ""
     private val terminalRefresh = Runnable {
         val t = terminal ?: return@Runnable
         val view = terminalView ?: return@Runnable
-        view.text = t.text()
-        terminalScroll?.post { terminalScroll?.let { sv -> sv.getChildAt(0)?.let { c -> sv.scrollTo(0, maxOf(0, c.height - sv.height)) } } }
+        // Keep a text selection alive: retry shortly instead of replacing the text under it.
+        if (view.hasSelection()) { handler.postDelayed(terminalRefreshRetry, 400); return@Runnable }
+        val text = t.text()
+        if (text == terminalShown) return@Runnable
+        val sv = terminalScroll
+        val child = sv?.getChildAt(0)
+        val follow = sv == null || child == null || sv.scrollY + sv.height >= child.height - dp(24)
+        terminalShown = text
+        view.text = text
+        if (follow) sv?.post { sv.getChildAt(0)?.let { c -> sv.scrollTo(0, maxOf(0, c.height - sv.height)) } }
     }
+    private val terminalRefreshRetry = Runnable { scheduleTerminalRefresh() }
 
     private fun scheduleTerminalRefresh() {
         handler.removeCallbacks(terminalRefresh)
@@ -1253,7 +1265,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun closeTerminal() {
-        terminal?.close(); terminal = null; terminalFor = null
+        terminal?.close(); terminal = null; terminalFor = null; terminalShown = ""
     }
 
     /** Opens the shell for the current connection when needed (new connection, or the old one ended). */
@@ -1273,6 +1285,7 @@ class MainActivity : AppCompatActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(10), dp(12), dp(88)) // clear of the floating nav bar
         }
+        terminalShown = session?.text().orEmpty()
         val output = ui.label(session?.text() ?: if (adb == null) "Not connected. Use the connect button at the top." else "Starting shell...", 12f, R.color.md_on_surface, mono = true).apply {
             setTextIsSelectable(true)
             setPadding(dp(12), dp(10), dp(12), dp(10))
@@ -1285,13 +1298,13 @@ class MainActivity : AppCompatActivity() {
         scroll.post { scroll.getChildAt(0)?.let { c -> scroll.scrollTo(0, maxOf(0, c.height - scroll.height)) } }
         page.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f).apply { bottomMargin = dp(8) })
 
-        fun key(label: String, bytes: ByteArray) = ui.pill(label) { terminal?.send(bytes) ?: toast("Not connected", error = true) }.apply {
+        fun key(label: String, bytes: ByteArray) = ui.pill(label) { val t = ensureTerminal(); if (t == null) toast("Not connected", error = true) else t.send(bytes) }.apply {
             minHeight = dp(40); setPadding(dp(8), dp(6), dp(8), dp(6)); textSize = 14f
         }
         page.addView(ui.actionRow(
             key("^C", byteArrayOf(3)), key("Tab", byteArrayOf(9)),
             key("\u2191", "\u001B[A".toByteArray()), key("\u2193", "\u001B[B".toByteArray()),
-            ui.pill("Clear") { terminal?.clear(); terminal?.send("\n".toByteArray()) }.apply { minHeight = dp(40); setPadding(dp(8), dp(6), dp(8), dp(6)); textSize = 14f }
+            ui.pill("Clear") { ensureTerminal()?.let { it.clear(); it.send("\n".toByteArray()) } }.apply { minHeight = dp(40); setPadding(dp(8), dp(6), dp(8), dp(6)); textSize = 14f }
         ).apply { setPadding(0, 0, 0, dp(8)) }, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         val input = EditText(this).apply {
@@ -1304,7 +1317,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(dp(18), dp(12), dp(18), dp(12))
         }
         fun submit() {
-            val t = terminal ?: ensureTerminal()
+            val t = ensureTerminal()
             if (t == null) { toast("Not connected", error = true); return }
             t.sendLine(input.text.toString())
             input.setText("")

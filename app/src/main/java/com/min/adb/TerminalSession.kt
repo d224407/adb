@@ -6,16 +6,18 @@ import java.nio.ByteBuffer
 import java.nio.CharBuffer
 import java.nio.charset.CodingErrorAction
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import kotlin.concurrent.thread
 
 /**
  * A persistent interactive shell on the device: one `shell:` stream (adbd gives it a PTY, like
- * `adb shell`), so cd/env/history persist, output streams live, Ctrl-C works. Output is run through
- * a tiny terminal emulator (ANSI escapes stripped, \r overwrite, backspace, clear screen).
+ * `adb shell`), so cd/env/history persist, output streams live, Ctrl-C works. Output goes through
+ * a small terminal emulator: a growing list of lines with a cursor, so \r overwrite, backspace,
+ * tabs, erase-line/screen, cursor moves and delete/insert chars (shell line editing, history,
+ * tab completion) render correctly. Colors and other attributes are dropped.
  */
 class TerminalSession(private val connection: AdbConnection, private val onChange: () -> Unit) {
     @Volatile private var stream: AdbStream? = null
-    private val model = StringBuilder()
     private val writer = Executors.newSingleThreadExecutor()
     @Volatile var ended = false
         private set
@@ -24,9 +26,13 @@ class TerminalSession(private val connection: AdbConnection, private val onChang
         .onMalformedInput(CodingErrorAction.REPLACE).onUnmappableCharacter(CodingErrorAction.REPLACE)
     private var carry = ByteArray(0)
 
+    // Screen model, guarded by `lines`.
+    private val lines = ArrayList<StringBuilder>().apply { add(StringBuilder()) }
+    private var row = 0
+    private var col = 0
+
     private var state = NORMAL
     private val csi = StringBuilder()
-    private var pendingCr = false
 
     init {
         // Everything touching the socket (opening the stream included) stays off the UI thread.
@@ -42,28 +48,44 @@ class TerminalSession(private val connection: AdbConnection, private val onChang
                     onChange()
                 }
             } catch (_: Exception) { }
-            synchronized(model) { if (model.isNotEmpty() && model.last() != '\n') model.append('\n'); model.append("[session closed]\n") }
+            synchronized(lines) {
+                row = lines.size - 1
+                if (lines[row].isNotEmpty()) { lines.add(StringBuilder()); row++ }
+                lines[row].append("[session closed]")
+                lines.add(StringBuilder())
+                row++
+                col = 0
+            }
             ended = true
             onChange()
         }
     }
 
-    fun text(): String = synchronized(model) { model.toString() }
+    fun text(): String = synchronized(lines) { lines.joinToString("\n") }
 
-    fun clear() { synchronized(model) { model.setLength(0) }; onChange() }
+    fun clear() { synchronized(lines) { reset() }; onChange() }
 
     fun sendLine(line: String) = send((line + "\n").toByteArray(Charsets.UTF_8))
 
     fun send(bytes: ByteArray) {
         if (ended) return
-        writer.execute {
-            try {
-                // The reader thread opens the stream; wait briefly for it on first use.
-                var waited = 0
-                while (stream == null && !ended && waited < 5000) { Thread.sleep(20); waited += 20 }
-                stream?.write(bytes)
-            } catch (_: Exception) { }
-        }
+        try {
+            writer.execute {
+                try {
+                    // The reader thread opens the stream; wait briefly for it on first use.
+                    var waited = 0
+                    while (stream == null && !ended && waited < 5000) { Thread.sleep(20); waited += 20 }
+                    val st = stream ?: return@execute
+                    // Small frames: older adbd builds only accept 4 KB per WRTE.
+                    var off = 0
+                    while (off < bytes.size && !ended) {
+                        val n = minOf(WRITE_CHUNK, bytes.size - off)
+                        st.write(bytes.copyOfRange(off, off + n))
+                        off += n
+                    }
+                } catch (_: Exception) { }
+            }
+        } catch (_: RejectedExecutionException) { }
     }
 
     fun close() {
@@ -83,46 +105,111 @@ class TerminalSession(private val connection: AdbConnection, private val onChang
         return out.toString()
     }
 
-    private fun feed(s: String) = synchronized(model) {
+    private fun feed(s: String) = synchronized(lines) {
         for (ch in s) {
             when (state) {
                 NORMAL -> when (ch) {
                     '\u001B' -> state = ESC
-                    '\r' -> pendingCr = true
-                    '\n' -> { pendingCr = false; model.append('\n') }
-                    '\b' -> if (model.isNotEmpty() && model.last() != '\n') model.setLength(model.length - 1)
-                    '\t' -> { applyCr(); model.append('\t') }
-                    else -> if (ch >= ' ') { applyCr(); model.append(ch) }
+                    '\r' -> col = 0
+                    '\n' -> lineFeed()
+                    '\b' -> if (col > 0) col--
+                    '\t' -> col = (col / 8 + 1) * 8
+                    else -> if (ch >= ' ') put(ch)
                 }
                 ESC -> state = when (ch) {
                     '[' -> { csi.setLength(0); CSI }
                     ']' -> OSC
                     '(', ')' -> SKIP1
+                    'c' -> { reset(); NORMAL }
                     else -> NORMAL
                 }
-                CSI -> if (ch in '@'..'~') {
-                    if (ch == 'J' && (csi.toString() == "2" || csi.toString() == "3")) model.setLength(0)
-                    state = NORMAL
-                } else csi.append(ch)
+                CSI -> if (ch in '@'..'~') { runCsi(ch); state = NORMAL } else csi.append(ch)
                 OSC -> if (ch == '\u0007') state = NORMAL else if (ch == '\u001B') state = ESC
                 SKIP1 -> state = NORMAL
             }
         }
-        if (model.length > MAX_CHARS) {
-            val cut = model.indexOf("\n", model.length - MAX_CHARS + 20_000)
-            model.delete(0, if (cut > 0) cut + 1 else model.length - MAX_CHARS)
+        trim()
+    }
+
+    private fun reset() {
+        lines.clear()
+        lines.add(StringBuilder())
+        row = 0
+        col = 0
+    }
+
+    private fun put(ch: Char) {
+        val line = lines[row]
+        while (line.length < col) line.append(' ')
+        if (col < line.length) line.setCharAt(col, ch) else line.append(ch)
+        col++
+    }
+
+    /** The tty turns \n into \r\n on output, so a line feed also returns to column 0. */
+    private fun lineFeed() {
+        row++
+        if (row >= lines.size) lines.add(StringBuilder())
+        col = 0
+    }
+
+    private fun runCsi(cmd: Char) {
+        val raw = csi.toString()
+        if (raw.startsWith("?") || raw.startsWith(">") || raw.startsWith("=") || raw.startsWith("!")) return
+        val params = raw.split(';').map { it.toIntOrNull() }
+        fun p(i: Int, def: Int): Int = params.getOrNull(i) ?: def
+        val n = maxOf(1, p(0, 1))
+        val line = lines[row]
+        when (cmd) {
+            'K' -> when (p(0, 0)) {
+                0 -> if (col < line.length) line.setLength(col)
+                1 -> for (i in 0 until minOf(col + 1, line.length)) line.setCharAt(i, ' ')
+                2 -> line.setLength(0)
+            }
+            'J' -> when (p(0, 0)) {
+                0 -> {
+                    if (col < line.length) line.setLength(col)
+                    while (lines.size > row + 1) lines.removeAt(lines.size - 1)
+                }
+                2, 3 -> reset()
+            }
+            'C' -> col += n
+            'D' -> col = maxOf(0, col - n)
+            'A' -> row = maxOf(0, row - n)
+            'B' -> { row += n; while (lines.size <= row) lines.add(StringBuilder()) }
+            'G' -> col = maxOf(0, p(0, 1) - 1)
+            'H', 'f' -> {
+                val top = maxOf(0, lines.size - SCREEN_ROWS)
+                row = minOf(lines.size - 1, top + maxOf(1, p(0, 1)) - 1)
+                col = maxOf(0, p(1, 1) - 1)
+            }
+            'P' -> if (col < line.length) line.delete(col, minOf(line.length, col + n))
+            '@' -> {
+                while (line.length < col) line.append(' ')
+                line.insert(col, " ".repeat(n))
+            }
+            'X' -> for (i in col until minOf(line.length, col + n)) line.setCharAt(i, ' ')
         }
     }
 
-    /** A lone \r returns to column 0: the next printable char overwrites the current line. */
-    private fun applyCr() {
-        if (!pendingCr) return
-        pendingCr = false
-        model.setLength(model.lastIndexOf("\n") + 1)
+    private fun trim() {
+        if (lines.size > MAX_LINES) {
+            val drop = lines.size - MAX_LINES + MAX_LINES / 10
+            repeat(drop) { lines.removeAt(0) }
+            row = maxOf(0, row - drop)
+        }
+        val line = lines[row]
+        if (line.length > MAX_LINE) {
+            val cut = line.length - MAX_LINE
+            line.delete(0, cut)
+            col = maxOf(0, col - cut)
+        }
     }
 
     private companion object {
         const val NORMAL = 0; const val ESC = 1; const val CSI = 2; const val OSC = 3; const val SKIP1 = 4
-        const val MAX_CHARS = 120_000
+        const val MAX_LINES = 3000
+        const val MAX_LINE = 8000
+        const val SCREEN_ROWS = 24
+        const val WRITE_CHUNK = 4096
     }
 }

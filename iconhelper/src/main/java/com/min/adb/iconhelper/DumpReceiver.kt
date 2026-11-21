@@ -10,7 +10,6 @@ import android.graphics.drawable.Drawable
 import android.os.Build
 import java.io.ByteArrayOutputStream
 import java.io.File
-import java.security.MessageDigest
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 import java.util.zip.Deflater
@@ -19,8 +18,8 @@ import java.util.zip.ZipOutputStream
 
 /**
  * Headless helper. Builds ONE icons.zip in Android/data/<this package>/files/<dir>:
- *  - <pkg>.webp for every app whose sha256 fingerprint changed since the last run
- *  - manifest.tsv: pkg<TAB>sha256<TAB>label for every installed app (label empty if unchanged)
+ *  - <pkg>.webp for every app whose fingerprint (version + update time + APK size) changed since the last run
+ *  - manifest.tsv: pkg<TAB>fingerprint<TAB>label for every installed app (label empty if unchanged)
  * DONE marks a complete run, ERROR (with a message) a failed one.
  * Extras: dir (run folder), token (caller's cache token), next (token to store after this run).
  * Only when token matches the one stored by the previous run are unchanged apps skipped.
@@ -129,13 +128,11 @@ class DumpReceiver : BroadcastReceiver() {
         }
     }
 
-    /** sha256 over what changes when an app is updated; hashing every APK would read gigabytes. */
+    /** Same signals PackageManager itself uses to notice an update; no hashing of APK contents. */
     private fun fingerprint(info: PackageInfo, sourceDir: String?): String {
         val code = if (Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong()
-        val apk = sourceDir?.let { File(it) }
-        val raw = "${info.packageName}|$code|${info.lastUpdateTime}|$sourceDir|${apk?.length() ?: 0}|${apk?.lastModified() ?: 0}"
-        return MessageDigest.getInstance("SHA-256").digest(raw.toByteArray(Charsets.UTF_8))
-            .joinToString("") { "%02x".format(it) }
+        val size = sourceDir?.let { File(it).length() } ?: 0L
+        return "$code.${info.lastUpdateTime}.$size"
     }
 
     private fun render(drawable: Drawable, size: Int): Bitmap {
